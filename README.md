@@ -6,7 +6,7 @@ Triton kernels for attention-related workloads (Phase 1: synthetic tensors; late
 
 - `kernels/` — Triton kernels (e.g. `attention.py`)
 - `tests/` — correctness tests
-- `benchmarks/` — latency and memory experiments (reserved)
+- `benchmarks/` — GPT-2 reference vs Triton scripts and run logs
 - `experiments/` — notebooks or scripts (reserved)
 - `models/` — future LLaMA integration (reserved)
 - `utils/` — shared helpers (reserved)
@@ -36,3 +36,21 @@ python main.py
 ```
 
 Prints the max absolute difference versus PyTorch SDPA on fixed small shapes.
+
+## Benchmarks
+
+Compares Hugging Face GPT-2 attention with the Triton-patched model (decode steps). Downloads checkpoints and WikiText-2 on first run (requires network).
+
+```bash
+python -m benchmarks.run_gpt2_benchmark
+```
+
+By default this runs **gpt2**, **gpt2-medium**, **gpt2-large**, and **gpt2-xl** in order. Use `--models` to limit or reorder, e.g. `--models gpt2 gpt2-large`. Larger checkpoints need more VRAM; if a size fails (for example CUDA OOM), use `--continue-on-error` to finish the remaining models and record failures in `run_summary.json` and per-model `error.json`.
+
+Each run writes a timestamped root folder `benchmarks/logs/<YYYY-MM-DD_HHMMSS>/` containing:
+
+- `run_summary.json` — which models completed or failed
+- `decode_ms_per_token_by_size.png` — cross-model decode latency (when at least one model completed)
+- Per checkpoint subdirectory `<model_id>/` with `results.csv`, `metrics.json`, and the same five PNGs as before (`decode_latency.png`, `peak_vram.png`, `throughput.png`, `perplexity.png`, `logit_agreement.png`)
+
+CUDA is required.
