@@ -2,3 +2,4 @@
 *.png
 benchmarks/logs
 tests/logs/
+kvcache/

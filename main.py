@@ -1,4 +1,4 @@
-"""Smoke test: compare Triton attention to PyTorch SDPA."""
+"""Smoke test: compare Triton attention to PyTorch SDPA (decode + prefill)."""
 
 import sys
 
@@ -14,16 +14,29 @@ def main() -> None:
         sys.exit(1)
 
     torch.manual_seed(0)
-    batch, heads, seq_len, d_head = 2, 4, 64, 64
+    batch, heads, d_head = 2, 4, 64
+
+    # Decode: single query against cached KV.
+    seq_len = 64
     q = torch.randn(batch, heads, 1, d_head, device="cuda", dtype=torch.float32)
     k = torch.randn(batch, heads, seq_len, d_head, device="cuda", dtype=torch.float32)
     v = torch.randn(batch, heads, seq_len, d_head, device="cuda", dtype=torch.float32)
 
     out_ref = F.scaled_dot_product_attention(q, k, v, is_causal=False)
     out = attention_forward(q, k, v)
-
     diff = (out - out_ref).abs().max().item()
-    print(f"max abs diff vs SDPA: {diff}")
+    print(f"[decode]  max abs diff vs SDPA: {diff}")
+
+    # Prefill: full sequence with causal masking.
+    sq = 64
+    q = torch.randn(batch, heads, sq, d_head, device="cuda", dtype=torch.float32)
+    k = torch.randn(batch, heads, sq, d_head, device="cuda", dtype=torch.float32)
+    v = torch.randn(batch, heads, sq, d_head, device="cuda", dtype=torch.float32)
+
+    out_ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    out = attention_forward(q, k, v, is_causal=True)
+    diff = (out - out_ref).abs().max().item()
+    print(f"[prefill] max abs diff vs SDPA: {diff}")
 
 
 if __name__ == "__main__":
