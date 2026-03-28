@@ -1,8 +1,7 @@
 """When GPT-2 uses Triton vs Hugging Face attention.
 
-Triton runs only for self-attention with query length 1 on CUDA, unless eager
-attention is combined with reorder_and_upcast_attn (then the upcast path runs).
-Prefill uses q_len > 1 so it never uses Triton.
+Triton now runs for *all* self-attention on CUDA (both prefill and decode),
+unless eager attention is combined with reorder_and_upcast_attn.
 """
 
 from unittest.mock import patch
@@ -18,7 +17,7 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 @cuda
-def test_prefill_does_not_invoke_triton_kernel():
+def test_prefill_invokes_triton_once_per_layer():
     calls = []
     real = gpt2_triton.attention_forward
 
@@ -35,7 +34,7 @@ def test_prefill_does_not_invoke_triton_kernel():
         with torch.no_grad():
             model(input_ids=input_ids, use_cache=True)
 
-    assert len(calls) == 0
+    assert len(calls) == model.config.n_layer
 
 
 @cuda

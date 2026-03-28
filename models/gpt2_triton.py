@@ -83,9 +83,9 @@ class GPT2AttentionTriton(GPT2Attention):
 
         use_triton = (
             not is_cross_attention
-            and query_states.size(-2) == 1
             and query_states.is_cuda
             and not (using_eager and self.reorder_and_upcast_attn)
+            and (query_states.shape[-2] == 1 or attention_mask is None)
         )
 
         if using_eager and self.reorder_and_upcast_attn:
@@ -97,6 +97,7 @@ class GPT2AttentionTriton(GPT2Attention):
                 query_states.contiguous(),
                 key_states.contiguous(),
                 value_states.contiguous(),
+                is_causal=is_causal,
             )
             attn_output = attn_output.transpose(1, 2)
             attn_weights = None
