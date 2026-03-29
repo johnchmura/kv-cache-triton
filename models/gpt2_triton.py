@@ -85,7 +85,8 @@ class GPT2AttentionTriton(GPT2Attention):
             not is_cross_attention
             and query_states.is_cuda
             and not (using_eager and self.reorder_and_upcast_attn)
-            and (query_states.shape[-2] == 1 or attention_mask is None)
+            and query_states.shape[-2] > 1
+            and attention_mask is None
         )
 
         if using_eager and self.reorder_and_upcast_attn:
