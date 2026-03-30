@@ -30,7 +30,14 @@ if str(_ROOT) not in sys.path:
 from benchmarks.eval_calibration import compute_lm_ece, load_calibration_texts
 from benchmarks.eval_longbench import run_longbench_eval
 from benchmarks.eval_passkey import run_passkey_eval
+from benchmarks.kv_cache_metrics import (
+    kv_cache_storage_nbytes,
+    microbench_hf_kv_update_ms_per_decode_step,
+    microbench_quant_kv_append_ms_per_decode_step,
+)
+from models.gpt2_quant import replace_gpt2_attention_with_quantized
 from models.gpt2_triton import replace_gpt2_attention_with_triton
+from models.kv_cache import QuantizedKVCache
 
 DEFAULT_MODELS = ["gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"]
 DEFAULT_LONGBENCH_SUBSETS = ["narrativeqa", "triviaqa"]
@@ -46,13 +53,22 @@ def _run_prefill_decode(
     input_ids: torch.Tensor,
     num_decode_steps: int,
 ) -> None:
+    attn0 = getattr(getattr(model, "transformer", None), "h", [None])[0]
+    quant_group_size = getattr(getattr(attn0, "attn", None), "quant_group_size", None)
+    quant_cache = QuantizedKVCache(group_size=int(quant_group_size)) if quant_group_size is not None else None
+
     with torch.no_grad():
-        out = model(input_ids=input_ids, use_cache=True)
-        past = out.past_key_values
+        if quant_cache is None:
+            out = model(input_ids=input_ids, use_cache=True)
+            past = out.past_key_values
+        else:
+            out = model(input_ids=input_ids, use_cache=True, past_key_values=quant_cache)
+            past = quant_cache
         next_id = torch.randint(0, 50257, (1, 1), device=input_ids.device, dtype=torch.long)
         for _ in range(num_decode_steps):
             out = model(input_ids=next_id, past_key_values=past, use_cache=True)
-            past = out.past_key_values
+            if quant_cache is None:
+                past = out.past_key_values
             next_id = torch.randint(0, 50257, (1, 1), device=input_ids.device, dtype=torch.long)
 
 
@@ -63,8 +79,8 @@ def benchmark_decode(
     num_decode_steps: int,
     warmup: int,
     seed: int,
-) -> tuple[float, float, float]:
-    """Returns prefill_ms, decode_total_ms, peak_alloc_mib."""
+) -> tuple[float, float, float, int]:
+    """Returns prefill_ms, decode_total_ms, peak_alloc_mib, kv_cache_storage_bytes."""
     torch.manual_seed(seed)
     input_ids = torch.randint(0, 50257, (1, prefill_len), device=device, dtype=torch.long)
 
@@ -80,15 +96,24 @@ def benchmark_decode(
     with torch.no_grad():
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        out = model(input_ids=input_ids, use_cache=True)
+        attn0 = getattr(getattr(model, "transformer", None), "h", [None])[0]
+        quant_group_size = getattr(getattr(attn0, "attn", None), "quant_group_size", None)
+        quant_cache = QuantizedKVCache(group_size=int(quant_group_size)) if quant_group_size is not None else None
+
+        if quant_cache is None:
+            out = model(input_ids=input_ids, use_cache=True)
+            past = out.past_key_values
+        else:
+            out = model(input_ids=input_ids, use_cache=True, past_key_values=quant_cache)
+            past = quant_cache
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        past = out.past_key_values
         next_id = torch.randint(0, 50257, (1, 1), device=device, dtype=torch.long)
         t2 = time.perf_counter()
         for _ in range(num_decode_steps):
             out = model(input_ids=next_id, past_key_values=past, use_cache=True)
-            past = out.past_key_values
+            if quant_cache is None:
+                past = out.past_key_values
             next_id = torch.randint(0, 50257, (1, 1), device=device, dtype=torch.long)
         torch.cuda.synchronize()
         t3 = time.perf_counter()
@@ -96,7 +121,8 @@ def benchmark_decode(
     prefill_ms = (t1 - t0) * 1000.0
     decode_ms = (t3 - t2) * 1000.0
     peak_mib = torch.cuda.max_memory_allocated() / (1024**2)
-    return prefill_ms, decode_ms, peak_mib
+    kv_bytes = kv_cache_storage_nbytes(past)
+    return prefill_ms, decode_ms, peak_mib, kv_bytes
 
 
 def compute_ppl(
@@ -154,16 +180,33 @@ def logit_parity_metrics(
     input_ids = torch.randint(0, 50257, (1, prefill_len), device=device, dtype=torch.long)
 
     with torch.no_grad():
-        out_a = model_a(input_ids=input_ids, use_cache=True)
-        past_a = out_a.past_key_values
-        out_b = model_b(input_ids=input_ids, use_cache=True)
-        past_b = out_b.past_key_values
+        attn0_a = getattr(getattr(model_a, "transformer", None), "h", [None])[0]
+        qg_a = getattr(getattr(attn0_a, "attn", None), "quant_group_size", None)
+        cache_a = QuantizedKVCache(group_size=int(qg_a)) if qg_a is not None else None
+        attn0_b = getattr(getattr(model_b, "transformer", None), "h", [None])[0]
+        qg_b = getattr(getattr(attn0_b, "attn", None), "quant_group_size", None)
+        cache_b = QuantizedKVCache(group_size=int(qg_b)) if qg_b is not None else None
+
+        if cache_a is None:
+            out_a = model_a(input_ids=input_ids, use_cache=True)
+            past_a = out_a.past_key_values
+        else:
+            out_a = model_a(input_ids=input_ids, use_cache=True, past_key_values=cache_a)
+            past_a = cache_a
+        if cache_b is None:
+            out_b = model_b(input_ids=input_ids, use_cache=True)
+            past_b = out_b.past_key_values
+        else:
+            out_b = model_b(input_ids=input_ids, use_cache=True, past_key_values=cache_b)
+            past_b = cache_b
         next_id = torch.randint(0, 50257, (1, 1), device=device, dtype=torch.long)
         for _ in range(decode_steps):
             out_a = model_a(input_ids=next_id, past_key_values=past_a, use_cache=True)
-            past_a = out_a.past_key_values
+            if cache_a is None:
+                past_a = out_a.past_key_values
             out_b = model_b(input_ids=next_id, past_key_values=past_b, use_cache=True)
-            past_b = out_b.past_key_values
+            if cache_b is None:
+                past_b = out_b.past_key_values
             next_id = torch.randint(0, 50257, (1, 1), device=device, dtype=torch.long)
         logits_a = out_a.logits
         logits_b = out_b.logits
@@ -182,16 +225,17 @@ def plot_grouped_bars(
     path: Path,
     title: str,
     ylabel: str,
-    left_label: str,
-    right_label: str,
-    left_val: float,
-    right_val: float,
+    labels: list[str],
+    values: list[float],
 ) -> None:
+    if len(labels) != len(values):
+        raise ValueError("labels and values must have the same length")
     fig, ax = plt.subplots(figsize=(6, 4))
-    x = [0, 1]
-    ax.bar(x, [left_val, right_val], width=0.5, color=["#4477AA", "#DDAA33"])
+    x = list(range(len(labels)))
+    colors = ["#4477AA", "#DDAA33", "#44AA99", "#AA4499"]
+    ax.bar(x, values, width=0.55, color=colors[: len(labels)])
     ax.set_xticks(x)
-    ax.set_xticklabels([left_label, right_label])
+    ax.set_xticklabels(labels)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     fig.tight_layout()
@@ -214,24 +258,80 @@ def plot_agreement_bars(path: Path, max_abs: float, rel_ppl_pct: float) -> None:
 
 def plot_cross_model_decode_latency(
     path: Path,
-    rows: list[tuple[str, float, float]],
+    rows: list[tuple[str, float, float, float]],
 ) -> None:
-    """rows: (model_id, ref_ms_per_token, triton_ms_per_token)."""
+    """rows: (model_id, ref_ms_per_token, triton_ms_per_token, quant_ms_per_token)."""
     if not rows:
         return
     labels = [r[0] for r in rows]
     ref_v = [r[1] for r in rows]
     tr_v = [r[2] for r in rows]
+    q_v = [r[3] for r in rows]
     n = len(labels)
     idx = list(range(n))
-    width = 0.35
+    width = 0.25
     fig, ax = plt.subplots(figsize=(max(8, 1.2 * n), 4))
-    ax.bar([i - width / 2 for i in idx], ref_v, width, label="reference", color="#4477AA")
-    ax.bar([i + width / 2 for i in idx], tr_v, width, label="triton", color="#DDAA33")
+    ax.bar([i - width for i in idx], ref_v, width, label="reference", color="#4477AA")
+    ax.bar(idx, tr_v, width, label="triton", color="#DDAA33")
+    ax.bar([i + width for i in idx], q_v, width, label="quantized", color="#44AA99")
     ax.set_xticks(idx)
     ax.set_xticklabels(labels, fontsize=9)
     ax.set_ylabel("ms per token")
     ax.set_title("Decode latency by model (lower is better)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+def plot_cross_model_kv_storage(
+    path: Path,
+    rows: list[tuple[str, float, float, float]],
+) -> None:
+    """rows: (model_id, ref_kv_mib, triton_kv_mib, quant_kv_mib)."""
+    if not rows:
+        return
+    labels = [r[0] for r in rows]
+    ref_v = [r[1] for r in rows]
+    tr_v = [r[2] for r in rows]
+    q_v = [r[3] for r in rows]
+    n = len(labels)
+    idx = list(range(n))
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(max(8, 1.2 * n), 4))
+    ax.bar([i - width for i in idx], ref_v, width, label="reference", color="#4477AA")
+    ax.bar(idx, tr_v, width, label="triton", color="#DDAA33")
+    ax.bar([i + width for i in idx], q_v, width, label="quantized", color="#44AA99")
+    ax.set_xticks(idx)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("MiB (KV tensors only)")
+    ax.set_title("KV cache tensor storage by model")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+def plot_cross_model_kv_update(
+    path: Path,
+    rows: list[tuple[str, float, float]],
+) -> None:
+    """rows: (model_id, hf_cache_update_ms, quant_append_ms)."""
+    if not rows:
+        return
+    labels = [r[0] for r in rows]
+    hf_v = [r[1] for r in rows]
+    q_v = [r[2] for r in rows]
+    n = len(labels)
+    idx = list(range(n))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(max(8, 1.2 * n), 4))
+    ax.bar([i - width / 2 for i in idx], hf_v, width, label="HF DynamicCache.update", color="#4477AA")
+    ax.bar([i + width / 2 for i in idx], q_v, width, label="quant append", color="#44AA99")
+    ax.set_xticks(idx)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("ms per decode step (microbench)")
+    ax.set_title("KV cache update latency (lower is better)")
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=120)
@@ -257,93 +357,118 @@ def _write_artifacts(out_dir: Path, metrics: dict[str, Any]) -> None:
 
     ms_per_tok_ref = metrics["ref_decode_ms_per_token"]
     ms_per_tok_tr = metrics["triton_decode_ms_per_token"]
+    ms_per_tok_q = metrics.get("quant_decode_ms_per_token")
     ref_peak = metrics["ref_peak_cuda_mib"]
     tr_peak = metrics["triton_peak_cuda_mib"]
+    q_peak = metrics.get("quant_peak_cuda_mib")
     ppl_ref = metrics["ppl_reference"]
     ppl_tr = metrics["ppl_triton"]
+    ppl_q = metrics.get("ppl_quant")
     max_logit_diff = metrics["max_abs_logits_diff"]
     rel_ppl_pct = metrics["rel_ppl_delta_pct"]
+    max_logit_diff_q = metrics.get("max_abs_logits_diff_quant")
+    rel_ppl_pct_q = metrics.get("rel_ppl_delta_quant_pct")
 
     plot_grouped_bars(
         out_dir / "decode_latency.png",
         "Decode latency (lower is better)",
         "ms per token",
-        "reference",
-        "triton",
-        float(ms_per_tok_ref),
-        float(ms_per_tok_tr),
+        ["reference", "triton", "quantized"],
+        [float(ms_per_tok_ref), float(ms_per_tok_tr), float(ms_per_tok_q)],
     )
     plot_grouped_bars(
         out_dir / "peak_vram.png",
         "Peak CUDA memory (decode benchmark run)",
         "MiB (max allocated)",
-        "reference",
-        "triton",
-        float(ref_peak),
-        float(tr_peak),
+        ["reference", "triton", "quantized"],
+        [float(ref_peak), float(tr_peak), float(q_peak)],
     )
+    ref_kv_m = metrics.get("ref_kv_cache_mib")
+    tr_kv_m = metrics.get("triton_kv_cache_mib")
+    q_kv_m = metrics.get("quant_kv_cache_mib")
+    if ref_kv_m is not None and tr_kv_m is not None and q_kv_m is not None:
+        plot_grouped_bars(
+            out_dir / "kv_cache_storage_mib.png",
+            "KV cache tensor storage (decode run, not peak CUDA)",
+            "MiB",
+            ["reference", "triton", "quantized"],
+            [float(ref_kv_m), float(tr_kv_m), float(q_kv_m)],
+        )
+    hf_u = metrics.get("hf_kv_update_ms_per_decode_step")
+    quant_u = metrics.get("quant_kv_append_ms_per_decode_step")
+    if hf_u is not None and quant_u is not None:
+        plot_grouped_bars(
+            out_dir / "kv_cache_update_latency.png",
+            "KV cache update microbench (one decode step, all layers)",
+            "ms",
+            ["HF cache.update", "quant append"],
+            [float(hf_u), float(quant_u)],
+        )
     plot_grouped_bars(
         out_dir / "throughput.png",
         "Decode throughput (higher is better)",
         "tokens/s",
-        "reference",
-        "triton",
-        float(metrics["ref_tokens_per_s"]),
-        float(metrics["triton_tokens_per_s"]),
+        ["reference", "triton", "quantized"],
+        [
+            float(metrics["ref_tokens_per_s"]),
+            float(metrics["triton_tokens_per_s"]),
+            float(metrics["quant_tokens_per_s"]),
+        ],
     )
     plot_grouped_bars(
         out_dir / "perplexity.png",
         "Perplexity on WikiText-2 validation (subset)",
         "PPL",
-        "reference",
-        "triton",
-        float(ppl_ref) if ppl_ref is not None else 0.0,
-        float(ppl_tr) if ppl_tr is not None else 0.0,
+        ["reference", "triton", "quantized"],
+        [
+            float(ppl_ref) if ppl_ref is not None else 0.0,
+            float(ppl_tr) if ppl_tr is not None else 0.0,
+            float(ppl_q) if ppl_q is not None else 0.0,
+        ],
     )
     plot_agreement_bars(out_dir / "logit_agreement.png", float(max_logit_diff), float(rel_ppl_pct))
+    if max_logit_diff_q is not None and rel_ppl_pct_q is not None:
+        plot_agreement_bars(out_dir / "logit_agreement_quant.png", float(max_logit_diff_q), float(rel_ppl_pct_q))
 
     pk_n = metrics.get("passkey_n_samples") or 0
     if isinstance(pk_n, (int, float)) and int(pk_n) > 0:
         pr = metrics.get("passkey_exact_match_rate_ref")
         pt = metrics.get("passkey_exact_match_rate_triton")
-        if pr is not None and pt is not None:
+        pq = metrics.get("passkey_exact_match_rate_quant")
+        if pr is not None and pt is not None and pq is not None:
             plot_grouped_bars(
                 out_dir / "passkey_match.png",
                 "Passkey retrieval (substring match rate)",
                 "rate",
-                "reference",
-                "triton",
-                float(pr),
-                float(pt),
+                ["reference", "triton", "quantized"],
+                [float(pr), float(pt), float(pq)],
             )
 
     cal_n = metrics.get("calibration_n_tokens") or 0
     if isinstance(cal_n, (int, float)) and int(cal_n) > 0:
         er = metrics.get("calibration_ece_reference")
         et = metrics.get("calibration_ece_triton")
-        if er is not None and et is not None and er == er and et == et:
+        eq = metrics.get("calibration_ece_quant")
+        if er is not None and et is not None and eq is not None and er == er and et == et and eq == eq:
             plot_grouped_bars(
                 out_dir / "calibration_ece.png",
                 "LM calibration (token ECE, lower is better)",
                 "ECE",
-                "reference",
-                "triton",
-                float(er),
-                float(et),
+                ["reference", "triton", "quantized"],
+                [float(er), float(et), float(eq)],
             )
 
     if "longbench_hit_rate_ref_mean" in metrics:
         lr = metrics.get("longbench_hit_rate_ref_mean")
         lt = metrics.get("longbench_hit_rate_triton_mean")
-        if lr is not None and lt is not None:
+        lq = metrics.get("longbench_hit_rate_quant_mean")
+        if lr is not None and lt is not None and lq is not None:
             plot_grouped_bars(
                 out_dir / "longbench_substring_hit.png",
                 "LongBench (truncated): substring hit rate",
                 "rate",
-                "reference",
-                "triton",
-                float(lr),
-                float(lt),
+                ["reference", "triton", "quantized"],
+                [float(lr), float(lt), float(lq)],
             )
 
 
@@ -363,13 +488,20 @@ def run_single_checkpoint(
     torch.manual_seed(args.seed)
 
     model_ref = load_gpt2_half(device, model_id)
-    ref_prefill_ms, ref_decode_ms, ref_peak = benchmark_decode(
+    ref_prefill_ms, ref_decode_ms, ref_peak, ref_kv_bytes = benchmark_decode(
         model_ref,
         device,
         args.prefill_len,
         args.num_decode_steps,
         args.warmup,
         args.seed,
+    )
+    hf_kv_update_ms = microbench_hf_kv_update_ms_per_decode_step(
+        model_ref.config,
+        device,
+        warmup=args.kv_microbench_warmup,
+        iters=args.kv_microbench_iters,
+        prefill_seq_len=args.kv_microbench_seq_len,
     )
     ppl_ref = compute_ppl(
         model_ref,
@@ -386,7 +518,7 @@ def run_single_checkpoint(
 
     model_tr = load_gpt2_half(device, model_id)
     replace_gpt2_attention_with_triton(model_tr)
-    tr_prefill_ms, tr_decode_ms, tr_peak = benchmark_decode(
+    tr_prefill_ms, tr_decode_ms, tr_peak, tr_kv_bytes = benchmark_decode(
         model_tr,
         device,
         args.prefill_len,
@@ -404,6 +536,36 @@ def run_single_checkpoint(
         args.max_eval_batches,
     )
 
+    model_q = load_gpt2_half(device, model_id)
+    replace_gpt2_attention_with_quantized(model_q, group_size=32)
+    q_prefill_ms, q_decode_ms, q_peak, q_kv_bytes = benchmark_decode(
+        model_q,
+        device,
+        args.prefill_len,
+        args.num_decode_steps,
+        args.warmup,
+        args.seed + 3,
+    )
+    attn0_q = getattr(getattr(model_q, "transformer", None), "h", [None])[0]
+    quant_gs = int(getattr(getattr(attn0_q, "attn", None), "quant_group_size", 32))
+    quant_kv_append_ms = microbench_quant_kv_append_ms_per_decode_step(
+        model_q.config,
+        device,
+        group_size=quant_gs,
+        warmup=args.kv_microbench_warmup,
+        iters=args.kv_microbench_iters,
+        prefill_seq_len=args.kv_microbench_seq_len,
+    )
+    ppl_q = compute_ppl(
+        model_q,
+        tokenizer,
+        texts,
+        device,
+        args.max_seq_len,
+        args.batch_size,
+        args.max_eval_batches,
+    )
+
     model_ref2 = load_gpt2_half(device, model_id)
     max_logit_diff, mean_logit_diff = logit_parity_metrics(
         model_ref2,
@@ -412,6 +574,14 @@ def run_single_checkpoint(
         args.prefill_len,
         args.logit_decode_steps,
         args.seed + 2,
+    )
+    max_logit_diff_q, mean_logit_diff_q = logit_parity_metrics(
+        model_ref2,
+        model_q,
+        device,
+        args.prefill_len,
+        args.logit_decode_steps,
+        args.seed + 4,
     )
 
     extra_eval: dict[str, Any] = {}
@@ -438,6 +608,24 @@ def run_single_checkpoint(
                 "passkey_ruler_style": pk.ruler_style,
             }
         )
+        pk_q = run_passkey_eval(
+            model_ref2,
+            model_q,
+            tokenizer,
+            device,
+            seed=args.seed + 41,
+            n_samples=args.passkey_samples,
+            passkey_len=args.passkey_len,
+            haystack_tokens=args.passkey_haystack_tokens,
+            max_context_tokens=args.max_context_tokens,
+            ruler_style=args.ruler_style,
+        )
+        extra_eval.update(
+            {
+                "passkey_exact_match_rate_quant": pk_q.exact_match_rate_triton,
+                "passkey_greedy_parity_rate_quant": pk_q.greedy_parity_rate,
+            }
+        )
 
     if args.longbench_max_samples > 0 and args.longbench_subsets:
         lb = run_longbench_eval(
@@ -456,6 +644,19 @@ def run_single_checkpoint(
         extra_eval["longbench_hit_rate_triton_mean"] = lb.hit_rate_triton_mean
         extra_eval["longbench_greedy_parity_rate_mean"] = lb.greedy_parity_rate_mean
         extra_eval["longbench_by_subset"] = [asdict(r) for r in lb.results]
+        lb_q = run_longbench_eval(
+            model_ref2,
+            model_q,
+            tokenizer,
+            device,
+            subsets=args.longbench_subsets,
+            max_samples_per_subset=args.longbench_max_samples,
+            max_context_tokens=args.max_context_tokens,
+            max_new_tokens=args.longbench_max_new_tokens,
+        )
+        extra_eval["longbench_hit_rate_quant_mean"] = lb_q.hit_rate_triton_mean
+        extra_eval["longbench_greedy_parity_rate_quant_mean"] = lb_q.greedy_parity_rate_mean
+        extra_eval["longbench_by_subset_quant"] = [asdict(r) for r in lb_q.results]
 
     if args.calibration_samples > 0 and cal_texts:
         ece_r, ntok_r = compute_lm_ece(
@@ -474,12 +675,22 @@ def run_single_checkpoint(
             args.calibration_max_seq_len,
             num_bins=args.calibration_ece_bins,
         )
+        ece_q, ntok_q = compute_lm_ece(
+            model_q,
+            tokenizer,
+            cal_texts,
+            device,
+            args.calibration_max_seq_len,
+            num_bins=args.calibration_ece_bins,
+        )
         extra_eval["calibration_source"] = args.calibration_source
         extra_eval["calibration_n_tokens_reference"] = ntok_r
         extra_eval["calibration_n_tokens_triton"] = ntok_t
+        extra_eval["calibration_n_tokens_quant"] = ntok_q
         extra_eval["calibration_ece_reference"] = ece_r
         extra_eval["calibration_ece_triton"] = ece_t
-        extra_eval["calibration_n_tokens"] = min(ntok_r, ntok_t)
+        extra_eval["calibration_ece_quant"] = ece_q
+        extra_eval["calibration_n_tokens"] = min(ntok_r, ntok_t, ntok_q)
 
     del model_ref2
     gc.collect()
@@ -489,14 +700,23 @@ def run_single_checkpoint(
     gc.collect()
     torch.cuda.empty_cache()
 
+    del model_q
+    gc.collect()
+    torch.cuda.empty_cache()
+
     ms_per_tok_ref = ref_decode_ms / args.num_decode_steps
     ms_per_tok_tr = tr_decode_ms / args.num_decode_steps
+    ms_per_tok_q = q_decode_ms / args.num_decode_steps
     tps_ref = args.num_decode_steps / (ref_decode_ms / 1000.0)
     tps_tr = args.num_decode_steps / (tr_decode_ms / 1000.0)
+    tps_q = args.num_decode_steps / (q_decode_ms / 1000.0)
 
     rel_ppl_pct = 0.0
     if ppl_ref is not None and ppl_tr is not None and ppl_ref > 0:
         rel_ppl_pct = abs(ppl_ref - ppl_tr) / ppl_ref * 100.0
+    rel_ppl_q_pct = 0.0
+    if ppl_ref is not None and ppl_q is not None and ppl_ref > 0:
+        rel_ppl_q_pct = abs(ppl_ref - ppl_q) / ppl_ref * 100.0
 
     metrics: dict[str, Any] = {
         "run_timestamp": run_timestamp,
@@ -520,11 +740,31 @@ def run_single_checkpoint(
         "triton_decode_ms_per_token": ms_per_tok_tr,
         "triton_tokens_per_s": tps_tr,
         "triton_peak_cuda_mib": tr_peak,
+        "quant_prefill_ms": q_prefill_ms,
+        "quant_decode_total_ms": q_decode_ms,
+        "quant_decode_ms_per_token": ms_per_tok_q,
+        "quant_tokens_per_s": tps_q,
+        "quant_peak_cuda_mib": q_peak,
+        "ref_kv_cache_bytes": ref_kv_bytes,
+        "ref_kv_cache_mib": ref_kv_bytes / (1024**2),
+        "triton_kv_cache_bytes": tr_kv_bytes,
+        "triton_kv_cache_mib": tr_kv_bytes / (1024**2),
+        "quant_kv_cache_bytes": q_kv_bytes,
+        "quant_kv_cache_mib": q_kv_bytes / (1024**2),
+        "hf_kv_update_ms_per_decode_step": hf_kv_update_ms,
+        "quant_kv_append_ms_per_decode_step": quant_kv_append_ms,
+        "kv_microbench_warmup": args.kv_microbench_warmup,
+        "kv_microbench_iters": args.kv_microbench_iters,
+        "kv_microbench_prefill_seq_len": args.kv_microbench_seq_len,
         "ppl_reference": ppl_ref,
         "ppl_triton": ppl_tr,
+        "ppl_quant": ppl_q,
         "rel_ppl_delta_pct": rel_ppl_pct,
+        "rel_ppl_delta_quant_pct": rel_ppl_q_pct,
         "max_abs_logits_diff": max_logit_diff,
         "mean_abs_logits_diff": mean_logit_diff,
+        "max_abs_logits_diff_quant": max_logit_diff_q,
+        "mean_abs_logits_diff_quant": mean_logit_diff_q,
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
     }
@@ -626,6 +866,24 @@ def main() -> None:
         default=15,
         help="Histogram bins for expected calibration error.",
     )
+    parser.add_argument(
+        "--kv-microbench-warmup",
+        type=int,
+        default=10,
+        help="Warmup rounds for KV cache update microbenchmarks.",
+    )
+    parser.add_argument(
+        "--kv-microbench-iters",
+        type=int,
+        default=50,
+        help="Timed iterations for KV cache update microbenchmarks.",
+    )
+    parser.add_argument(
+        "--kv-microbench-seq-len",
+        type=int,
+        default=0,
+        help="Untimed prefill length per layer before timed cache op (0 = cold first token).",
+    )
     args = parser.parse_args()
 
     lb_subs = [s.strip() for s in args.longbench_subsets.split(",") if s.strip()]
@@ -659,7 +917,9 @@ def main() -> None:
 
     completed: list[str] = []
     failed: list[dict[str, str]] = []
-    cross_rows: list[tuple[str, float, float]] = []
+    cross_rows: list[tuple[str, float, float, float]] = []
+    cross_kv_storage: list[tuple[str, float, float, float]] = []
+    cross_kv_update: list[tuple[str, float, float]] = []
 
     for model_id in model_ids:
         sub = out_root / model_id
@@ -682,6 +942,22 @@ def main() -> None:
                     model_id,
                     float(metrics["ref_decode_ms_per_token"]),
                     float(metrics["triton_decode_ms_per_token"]),
+                    float(metrics["quant_decode_ms_per_token"]),
+                )
+            )
+            cross_kv_storage.append(
+                (
+                    model_id,
+                    float(metrics["ref_kv_cache_mib"]),
+                    float(metrics["triton_kv_cache_mib"]),
+                    float(metrics["quant_kv_cache_mib"]),
+                )
+            )
+            cross_kv_update.append(
+                (
+                    model_id,
+                    float(metrics["hf_kv_update_ms_per_decode_step"]),
+                    float(metrics["quant_kv_append_ms_per_decode_step"]),
                 )
             )
             print(f"Completed {model_id} -> {sub}", file=sys.stderr)
@@ -707,6 +983,10 @@ def main() -> None:
 
     if cross_rows:
         plot_cross_model_decode_latency(out_root / "decode_ms_per_token_by_size.png", cross_rows)
+    if cross_kv_storage:
+        plot_cross_model_kv_storage(out_root / "kv_cache_storage_mib_by_size.png", cross_kv_storage)
+    if cross_kv_update:
+        plot_cross_model_kv_update(out_root / "kv_cache_update_ms_by_size.png", cross_kv_update)
 
     summary = {
         "timestamp": ts,

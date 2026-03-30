@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
+from models.kv_cache import QuantizedKVCache
+
 
 def effective_max_context(model: GPT2LMHeadModel, max_context_tokens: int | None) -> int:
     cap = int(model.config.n_positions)
@@ -49,8 +51,16 @@ def greedy_generate_with_cache(
     """Prefill input_ids (1, seq), then greedy decode max_new_tokens steps. Returns (1, max_new_tokens)."""
     model.eval()
     ids = input_ids.to(device)
-    out = model(input_ids=ids, use_cache=True)
-    past = out.past_key_values
+    attn0 = getattr(getattr(model, "transformer", None), "h", [None])[0]
+    quant_group_size = getattr(getattr(attn0, "attn", None), "quant_group_size", None)
+    quant_cache = QuantizedKVCache(group_size=int(quant_group_size)) if quant_group_size is not None else None
+
+    if quant_cache is None:
+        out = model(input_ids=ids, use_cache=True)
+        past = out.past_key_values
+    else:
+        out = model(input_ids=ids, use_cache=True, past_key_values=quant_cache)
+        past = quant_cache
     logits = out.logits
     next_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)
     generated = [next_id]
