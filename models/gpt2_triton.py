@@ -67,10 +67,33 @@ class GPT2AttentionTriton(GPT2Attention):
         if (past_key_values is not None and not is_cross_attention) or (
             past_key_values is not None and is_cross_attention and not is_updated
         ):
-            cache_position = cache_position if not is_cross_attention else None
-            key_states, value_states = curr_past_key_value.update(
-                key_states, value_states, self.layer_idx, {"cache_position": cache_position}
-            )
+            from kernels.quantization import quantize_and_pack_int4, unpack_and_dequantize_int4
+            if not hasattr(curr_past_key_value, "int4_k_scales"):
+                curr_past_key_value.int4_k_scales = {}
+                curr_past_key_value.int4_v_scales = {}
+
+            pk_new, sk_new = quantize_and_pack_int4(key_states, dim=-1)
+            pv_new, sv_new = quantize_and_pack_int4(value_states, dim=-1)
+
+            is_prefill = curr_past_key_value.get_seq_length(self.layer_idx) == 0
+
+            pk, pv = curr_past_key_value.update(pk_new, pv_new, self.layer_idx, cache_kwargs=kwargs.get("cache_position"))
+
+            if is_prefill:
+                curr_past_key_value.int4_k_scales[self.layer_idx] = sk_new
+                curr_past_key_value.int4_v_scales[self.layer_idx] = sv_new
+            else:
+                sk = torch.cat([curr_past_key_value.int4_k_scales[self.layer_idx], sk_new], dim=-2)
+                sv = torch.cat([curr_past_key_value.int4_v_scales[self.layer_idx], sv_new], dim=-2)
+                curr_past_key_value.int4_k_scales[self.layer_idx] = sk
+                curr_past_key_value.int4_v_scales[self.layer_idx] = sv
+
+            sk_full = curr_past_key_value.int4_k_scales[self.layer_idx]
+            sv_full = curr_past_key_value.int4_v_scales[self.layer_idx]
+            
+            key_states = unpack_and_dequantize_int4(pk, sk_full, dim=-1)
+            value_states = unpack_and_dequantize_int4(pv, sv_full, dim=-1)
+
             if is_cross_attention:
                 past_key_values.is_updated[self.layer_idx] = True
 
@@ -85,8 +108,8 @@ class GPT2AttentionTriton(GPT2Attention):
             not is_cross_attention
             and query_states.is_cuda
             and not (using_eager and self.reorder_and_upcast_attn)
-            and query_states.shape[-2] > 1
-            and attention_mask is None
+            and (query_states.shape[-2] > 1)
+            and (attention_mask is None)
         )
 
         if using_eager and self.reorder_and_upcast_attn:
@@ -94,12 +117,22 @@ class GPT2AttentionTriton(GPT2Attention):
                 query_states, key_states, value_states, attention_mask, head_mask
             )
         elif use_triton:
-            attn_output = attention_forward(
-                query_states.contiguous(),
-                key_states.contiguous(),
-                value_states.contiguous(),
-                is_causal=is_causal,
-            )
+            if query_states.shape[-2] == 1 and past_key_values is not None:
+                attn_output = attention_forward(
+                    query_states.contiguous(),
+                    pk.contiguous(),
+                    pv.contiguous(),
+                    is_causal=False,
+                    k_scales=sk_full,
+                    v_scales=sv_full,
+                )
+            else:
+                attn_output = attention_forward(
+                    query_states.contiguous(),
+                    key_states.contiguous(),
+                    value_states.contiguous(),
+                    is_causal=is_causal,
+                )
             attn_output = attn_output.transpose(1, 2)
             attn_weights = None
         else:

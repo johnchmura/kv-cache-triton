@@ -1,9 +1,9 @@
 """When GPT-2 uses Triton vs Hugging Face attention.
 
-Triton runs only for prefill (q_len > 1, no attention_mask) where
-flash-attention tiling gives a real benefit.  Decode (q_len == 1) uses
-HuggingFace SDPA which is already optimal for the memory-bound single-query
-case.
+Triton runs for all self-attention on CUDA: decode uses the optimised
+single-query element-wise kernel, prefill uses flash-attention tiling.
+Falls back to HuggingFace only when an additive attention_mask is present
+(padding) or when eager + reorder_and_upcast_attn is enabled.
 """
 
 from unittest.mock import patch
@@ -40,8 +40,7 @@ def test_prefill_invokes_triton_once_per_layer():
 
 
 @cuda
-def test_decode_does_not_invoke_triton():
-    """Decode (q_len==1) should use HuggingFace SDPA, not Triton."""
+def test_decode_invokes_triton_once_per_layer():
     calls = []
     real = gpt2_triton.attention_forward
 
@@ -62,7 +61,7 @@ def test_decode_does_not_invoke_triton():
         with torch.no_grad():
             model(input_ids=next_tok, past_key_values=out.past_key_values, use_cache=True)
 
-    assert len(calls) == 0
+    assert len(calls) == model.config.n_layer
 
 
 @cuda

@@ -44,10 +44,15 @@ def test_single_query_matches_sdpa_fp32():
     v = torch.randn(batch, heads, seq_len, d_head, device="cuda", dtype=torch.float32)
 
     out_ref = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-    out = attention_forward(q, k, v)
+    
+    from kernels.quantization import quantize_and_pack_int4
+    pk, sk = quantize_and_pack_int4(k, dim=-1)
+    pv, sv = quantize_and_pack_int4(v, dim=-1)
+    out = attention_forward(q, pk, pv, k_scales=sk, v_scales=sv)
 
     assert torch.isfinite(out).all()
-    assert torch.allclose(out, out_ref, rtol=1e-3, atol=1e-3)
+    cos_sim = F.cosine_similarity(out.flatten(), out_ref.flatten(), dim=0)
+    assert cos_sim > 0.95
 
 
 @cuda
@@ -59,10 +64,15 @@ def test_single_query_matches_sdpa_fp16():
     v = torch.randn(batch, heads, seq_len, d_head, device="cuda", dtype=torch.float16)
 
     out_ref = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-    out = attention_forward(q, k, v)
+    
+    from kernels.quantization import quantize_and_pack_int4
+    pk, sk = quantize_and_pack_int4(k, dim=-1)
+    pv, sv = quantize_and_pack_int4(v, dim=-1)
+    out = attention_forward(q, pk, pv, k_scales=sk, v_scales=sv)
 
     assert torch.isfinite(out).all()
-    assert torch.allclose(out, out_ref, rtol=1e-2, atol=1e-2)
+    cos_sim = F.cosine_similarity(out.flatten(), out_ref.flatten(), dim=0)
+    assert cos_sim > 0.95
 
 
 @cuda
@@ -74,10 +84,15 @@ def test_single_query_non_power_of_two_seq():
     v = torch.randn(batch, heads, seq_len, d_head, device="cuda", dtype=torch.float32)
 
     out_ref = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-    out = attention_forward(q, k, v)
+    
+    from kernels.quantization import quantize_and_pack_int4
+    pk, sk = quantize_and_pack_int4(k, dim=-1)
+    pv, sv = quantize_and_pack_int4(v, dim=-1)
+    out = attention_forward(q, pk, pv, k_scales=sk, v_scales=sv)
 
     assert torch.isfinite(out).all()
-    assert torch.allclose(out, out_ref, rtol=1e-3, atol=1e-3)
+    cos_sim = F.cosine_similarity(out.flatten(), out_ref.flatten(), dim=0)
+    assert cos_sim > 0.95
 
 
 # --- multi-query (prefill), no causal mask ---
@@ -160,10 +175,15 @@ def test_decode_with_cache_q1_sk128():
     v = torch.randn(batch, heads, 128, d_head, device="cuda", dtype=torch.float32)
 
     out_ref = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-    out = attention_forward(q, k, v, is_causal=False)
+    
+    from kernels.quantization import quantize_and_pack_int4
+    pk, sk = quantize_and_pack_int4(k, dim=-1)
+    pv, sv = quantize_and_pack_int4(v, dim=-1)
+    out = attention_forward(q, pk, pv, is_causal=False, k_scales=sk, v_scales=sv)
 
     assert torch.isfinite(out).all()
-    assert torch.allclose(out, out_ref, rtol=1e-3, atol=1e-3)
+    cos_sim = F.cosine_similarity(out.flatten(), out_ref.flatten(), dim=0)
+    assert cos_sim > 0.95
 
 
 # --- shape parametrisation ---
@@ -179,7 +199,12 @@ def test_attention_param_shapes(batch, heads):
     v = torch.randn(batch, heads, seq_len, d_head, device="cuda", dtype=torch.float32)
 
     out_ref = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-    out = attention_forward(q, k, v)
+    
+    from kernels.quantization import quantize_and_pack_int4
+    pk, sk = quantize_and_pack_int4(k, dim=-1)
+    pv, sv = quantize_and_pack_int4(v, dim=-1)
+    out = attention_forward(q, pk, pv, k_scales=sk, v_scales=sv)
 
     assert torch.isfinite(out).all()
-    assert torch.allclose(out, out_ref, rtol=1e-3, atol=1e-3)
+    cos_sim = F.cosine_similarity(out.flatten(), out_ref.flatten(), dim=0)
+    assert cos_sim > 0.95
