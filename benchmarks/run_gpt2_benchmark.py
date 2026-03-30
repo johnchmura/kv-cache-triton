@@ -9,6 +9,7 @@ import json
 import sys
 import time
 from argparse import Namespace
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,9 +27,13 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from benchmarks.eval_calibration import compute_lm_ece, load_calibration_texts
+from benchmarks.eval_longbench import run_longbench_eval
+from benchmarks.eval_passkey import run_passkey_eval
 from models.gpt2_triton import replace_gpt2_attention_with_triton
 
 DEFAULT_MODELS = ["gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"]
+DEFAULT_LONGBENCH_SUBSETS = ["narrativeqa", "triviaqa"]
 
 
 def _ensure_cuda() -> None:
@@ -240,11 +245,15 @@ def _write_artifacts(out_dir: Path, metrics: dict[str, Any]) -> None:
         for k, v in metrics.items():
             if v is None:
                 continue
-            if isinstance(v, (int, float, str)):
+            if isinstance(v, (dict, list)):
+                continue
+            if isinstance(v, bool):
+                w.writerow([k, int(v)])
+            elif isinstance(v, (int, float, str)):
                 w.writerow([k, v])
 
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(metrics, f, indent=2, default=str)
 
     ms_per_tok_ref = metrics["ref_decode_ms_per_token"]
     ms_per_tok_tr = metrics["triton_decode_ms_per_token"]
@@ -293,6 +302,50 @@ def _write_artifacts(out_dir: Path, metrics: dict[str, Any]) -> None:
     )
     plot_agreement_bars(out_dir / "logit_agreement.png", float(max_logit_diff), float(rel_ppl_pct))
 
+    pk_n = metrics.get("passkey_n_samples") or 0
+    if isinstance(pk_n, (int, float)) and int(pk_n) > 0:
+        pr = metrics.get("passkey_exact_match_rate_ref")
+        pt = metrics.get("passkey_exact_match_rate_triton")
+        if pr is not None and pt is not None:
+            plot_grouped_bars(
+                out_dir / "passkey_match.png",
+                "Passkey retrieval (substring match rate)",
+                "rate",
+                "reference",
+                "triton",
+                float(pr),
+                float(pt),
+            )
+
+    cal_n = metrics.get("calibration_n_tokens") or 0
+    if isinstance(cal_n, (int, float)) and int(cal_n) > 0:
+        er = metrics.get("calibration_ece_reference")
+        et = metrics.get("calibration_ece_triton")
+        if er is not None and et is not None and er == er and et == et:
+            plot_grouped_bars(
+                out_dir / "calibration_ece.png",
+                "LM calibration (token ECE, lower is better)",
+                "ECE",
+                "reference",
+                "triton",
+                float(er),
+                float(et),
+            )
+
+    if "longbench_hit_rate_ref_mean" in metrics:
+        lr = metrics.get("longbench_hit_rate_ref_mean")
+        lt = metrics.get("longbench_hit_rate_triton_mean")
+        if lr is not None and lt is not None:
+            plot_grouped_bars(
+                out_dir / "longbench_substring_hit.png",
+                "LongBench (truncated): substring hit rate",
+                "rate",
+                "reference",
+                "triton",
+                float(lr),
+                float(lt),
+            )
+
 
 def run_single_checkpoint(
     model_id: str,
@@ -301,6 +354,7 @@ def run_single_checkpoint(
     device: torch.device,
     tokenizer: GPT2Tokenizer,
     texts: list[str],
+    cal_texts: list[str],
     run_timestamp: str,
     cuda_name: str,
     args: Namespace,
@@ -359,6 +413,74 @@ def run_single_checkpoint(
         args.logit_decode_steps,
         args.seed + 2,
     )
+
+    extra_eval: dict[str, Any] = {}
+
+    if args.passkey_samples > 0:
+        pk = run_passkey_eval(
+            model_ref2,
+            model_tr,
+            tokenizer,
+            device,
+            seed=args.seed + 40,
+            n_samples=args.passkey_samples,
+            passkey_len=args.passkey_len,
+            haystack_tokens=args.passkey_haystack_tokens,
+            max_context_tokens=args.max_context_tokens,
+            ruler_style=args.ruler_style,
+        )
+        extra_eval.update(
+            {
+                "passkey_exact_match_rate_ref": pk.exact_match_rate_ref,
+                "passkey_exact_match_rate_triton": pk.exact_match_rate_triton,
+                "passkey_greedy_parity_rate": pk.greedy_parity_rate,
+                "passkey_n_samples": pk.n_samples,
+                "passkey_ruler_style": pk.ruler_style,
+            }
+        )
+
+    if args.longbench_max_samples > 0 and args.longbench_subsets:
+        lb = run_longbench_eval(
+            model_ref2,
+            model_tr,
+            tokenizer,
+            device,
+            subsets=args.longbench_subsets,
+            max_samples_per_subset=args.longbench_max_samples,
+            max_context_tokens=args.max_context_tokens,
+            max_new_tokens=args.longbench_max_new_tokens,
+        )
+        extra_eval["longbench_truncated"] = lb.longbench_truncated
+        extra_eval["longbench_prompt_token_cap"] = lb.longbench_prompt_token_cap
+        extra_eval["longbench_hit_rate_ref_mean"] = lb.hit_rate_ref_mean
+        extra_eval["longbench_hit_rate_triton_mean"] = lb.hit_rate_triton_mean
+        extra_eval["longbench_greedy_parity_rate_mean"] = lb.greedy_parity_rate_mean
+        extra_eval["longbench_by_subset"] = [asdict(r) for r in lb.results]
+
+    if args.calibration_samples > 0 and cal_texts:
+        ece_r, ntok_r = compute_lm_ece(
+            model_ref2,
+            tokenizer,
+            cal_texts,
+            device,
+            args.calibration_max_seq_len,
+            num_bins=args.calibration_ece_bins,
+        )
+        ece_t, ntok_t = compute_lm_ece(
+            model_tr,
+            tokenizer,
+            cal_texts,
+            device,
+            args.calibration_max_seq_len,
+            num_bins=args.calibration_ece_bins,
+        )
+        extra_eval["calibration_source"] = args.calibration_source
+        extra_eval["calibration_n_tokens_reference"] = ntok_r
+        extra_eval["calibration_n_tokens_triton"] = ntok_t
+        extra_eval["calibration_ece_reference"] = ece_r
+        extra_eval["calibration_ece_triton"] = ece_t
+        extra_eval["calibration_n_tokens"] = min(ntok_r, ntok_t)
+
     del model_ref2
     gc.collect()
     torch.cuda.empty_cache()
@@ -406,6 +528,7 @@ def run_single_checkpoint(
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
     }
+    metrics.update(extra_eval)
 
     _write_artifacts(out_dir, metrics)
     return metrics
@@ -434,7 +557,79 @@ def main() -> None:
     parser.add_argument("--max-seq-len", type=int, default=256)
     parser.add_argument("--logit-decode-steps", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=None,
+        help="Cap prompt length for passkey/LongBench (default: model n_positions). LongBench uses "
+        "tail-keep truncation: newest context tokens plus full query suffix.",
+    )
+    parser.add_argument(
+        "--passkey-samples",
+        type=int,
+        default=12,
+        help="Passkey eval count (0 disables). Cycles needle positions start/mid/end.",
+    )
+    parser.add_argument("--passkey-len", type=int, default=8, help="Random passkey string length.")
+    parser.add_argument(
+        "--passkey-haystack-tokens",
+        type=int,
+        default=768,
+        help="Target token count for filler plus needle (clamped by --max-context-tokens).",
+    )
+    parser.add_argument(
+        "--ruler-style",
+        action="store_true",
+        help="RULER-style two-key haystack; prompt asks for the primary key.",
+    )
+    parser.add_argument(
+        "--longbench-subsets",
+        type=str,
+        default=",".join(DEFAULT_LONGBENCH_SUBSETS),
+        help="Comma-separated THUDM/LongBench subset configs (e.g. narrativeqa,triviaqa). Ignored if "
+        "--longbench-max-samples is 0.",
+    )
+    parser.add_argument(
+        "--longbench-max-samples",
+        type=int,
+        default=0,
+        help="Max rows per subset from LongBench test split (0 disables). Scores are not comparable to "
+        "full-context leaderboards under GPT-2's 1024-token limit.",
+    )
+    parser.add_argument(
+        "--longbench-max-new-tokens",
+        type=int,
+        default=48,
+        help="Greedy continuation length for LongBench substring scoring.",
+    )
+    parser.add_argument(
+        "--calibration-samples",
+        type=int,
+        default=128,
+        help="Streaming texts for token-level ECE (0 disables).",
+    )
+    parser.add_argument(
+        "--calibration-source",
+        choices=["c4", "pile"],
+        default="c4",
+        help="Corpus for calibration subset (Pile falls back to minipile if the full pile is unavailable).",
+    )
+    parser.add_argument(
+        "--calibration-max-seq-len",
+        type=int,
+        default=512,
+        help="Tokenizer truncation for each calibration document.",
+    )
+    parser.add_argument(
+        "--calibration-ece-bins",
+        type=int,
+        default=15,
+        help="Histogram bins for expected calibration error.",
+    )
     args = parser.parse_args()
+
+    lb_subs = [s.strip() for s in args.longbench_subsets.split(",") if s.strip()]
+    args.longbench_subsets = lb_subs
 
     model_ids = args.models if args.models is not None else list(DEFAULT_MODELS)
 
@@ -452,6 +647,14 @@ def main() -> None:
     need = args.batch_size * args.max_eval_batches
     texts = texts[:need]
 
+    cal_texts: list[str] = []
+    if args.calibration_samples > 0:
+        cal_texts = load_calibration_texts(
+            args.calibration_source,
+            args.calibration_samples,
+            args.seed,
+        )
+
     cuda_name = torch.cuda.get_device_name(0)
 
     completed: list[str] = []
@@ -468,6 +671,7 @@ def main() -> None:
                 device=device,
                 tokenizer=tokenizer,
                 texts=texts,
+                cal_texts=cal_texts,
                 run_timestamp=ts,
                 cuda_name=cuda_name,
                 args=args,
