@@ -8,6 +8,8 @@ import torch
 from datasets import load_dataset
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
+from benchmarks.eval_common import teacher_forced_incremental_logits
+
 
 def load_calibration_texts(
     source: Literal["c4", "pile"],
@@ -77,16 +79,15 @@ def compute_lm_ece(
         if input_ids.shape[1] < 2:
             continue
         with torch.no_grad():
-            out = model(input_ids=input_ids)
-        logits = out.logits.float()
-        logit_pred = logits[:, :-1, :]
-        targets = input_ids[:, 1:]
+            logit_pred, targets = teacher_forced_incremental_logits(model, input_ids, device)
+        if logit_pred.shape[0] == 0:
+            continue
         probs = torch.softmax(logit_pred, dim=-1)
-        true_prob = probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)
+        true_prob = probs.gather(1, targets.unsqueeze(-1)).squeeze(-1)
         pred_max = logit_pred.argmax(dim=-1)
         acc = (pred_max == targets).float()
-        confidences.extend(true_prob[0].cpu().tolist())
-        accuracies.extend(acc[0].cpu().tolist())
+        confidences.extend(true_prob.cpu().tolist())
+        accuracies.extend(acc.cpu().tolist())
 
     if not confidences:
         return float("nan"), 0

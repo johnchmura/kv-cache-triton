@@ -39,7 +39,7 @@ Prints the max absolute difference versus PyTorch SDPA on fixed small shapes.
 
 ## Benchmarks
 
-Compares Hugging Face GPT-2 attention with the Triton-patched model (decode steps). Downloads checkpoints, WikiText-2, and (when enabled) LongBench `data.zip` / streaming calibration data on first run (requires network).
+Compares Hugging Face GPT-2 reference attention with the quantized KV cache / attention path (decode steps, storage, and optional evals). Downloads checkpoints, WikiText-2, and (when enabled) LongBench `data.zip` / streaming calibration data on first run (requires network).
 
 ```bash
 python -m benchmarks.run_gpt2_benchmark

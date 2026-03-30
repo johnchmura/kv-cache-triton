@@ -21,7 +21,7 @@ FILLER_UNIT = (
 @dataclass
 class PasskeyMetrics:
     exact_match_rate_ref: float
-    exact_match_rate_triton: float
+    exact_match_rate_quant: float
     greedy_parity_rate: float
     n_samples: int
     ruler_style: bool
@@ -140,7 +140,7 @@ def _answer_matches(gold: str, decoded: str) -> bool:
 
 def run_passkey_eval(
     model_ref: GPT2LMHeadModel,
-    model_triton: GPT2LMHeadModel,
+    model_quant: GPT2LMHeadModel,
     tokenizer: GPT2Tokenizer,
     device: torch.device,
     *,
@@ -162,7 +162,7 @@ def run_passkey_eval(
 
     positions: list[Literal["start", "mid", "end"]] = ["start", "mid", "end"]
     hits_ref = 0
-    hits_tr = 0
+    hits_quant = 0
     parity = 0
     count = 0
     pos_counts = {"start": 0, "mid": 0, "end": 0}
@@ -184,18 +184,18 @@ def run_passkey_eval(
 
         if inp_ref.shape[1] > max_ctx:
             inp_ref = inp_ref[:, -max_ctx:]
-        inp_tr = inp_ref.clone()
+        inp_q = inp_ref.clone()
 
         gen_ref = greedy_generate_with_cache(model_ref, inp_ref, decode_tokens, device)
-        gen_tr = greedy_generate_with_cache(model_triton, inp_tr, decode_tokens, device)
+        gen_q = greedy_generate_with_cache(model_quant, inp_q, decode_tokens, device)
 
         dr = _decode_answer(tokenizer, gen_ref)
-        dt = _decode_answer(tokenizer, gen_tr)
+        dq = _decode_answer(tokenizer, gen_q)
         if _answer_matches(gold, dr):
             hits_ref += 1
-        if _answer_matches(gold, dt):
-            hits_tr += 1
-        if torch.equal(gen_ref.cpu(), gen_tr.cpu()):
+        if _answer_matches(gold, dq):
+            hits_quant += 1
+        if torch.equal(gen_ref.cpu(), gen_q.cpu()):
             parity += 1
         count += 1
 
@@ -204,7 +204,7 @@ def run_passkey_eval(
 
     return PasskeyMetrics(
         exact_match_rate_ref=rate(hits_ref, count),
-        exact_match_rate_triton=rate(hits_tr, count),
+        exact_match_rate_quant=rate(hits_quant, count),
         greedy_parity_rate=rate(parity, count),
         n_samples=count,
         ruler_style=ruler_style,

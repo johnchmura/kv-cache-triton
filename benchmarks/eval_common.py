@@ -7,6 +7,61 @@ from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
 from models.kv_cache import QuantizedKVCache
 
+PPL_ECE_EVAL_MODE = "teacher_forced_incremental_kv"
+
+
+def quantized_kv_cache_for_model(model: GPT2LMHeadModel) -> QuantizedKVCache | None:
+    attn0 = getattr(getattr(model, "transformer", None), "h", [None])[0]
+    quant_group_size = getattr(getattr(attn0, "attn", None), "quant_group_size", None)
+    return QuantizedKVCache(group_size=int(quant_group_size)) if quant_group_size is not None else None
+
+
+@torch.no_grad()
+def teacher_forced_incremental_logits(
+    model: GPT2LMHeadModel,
+    input_ids: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Next-token logits via KV cache (one forward per position). input_ids (1, L), L >= 1.
+
+    Returns logits (L-1, V) and targets (L-1,) for positions predicting input_ids[:, 1:].
+    If L < 2, returns empty tensors.
+    """
+    model.eval()
+    ids = input_ids.to(device)
+    if ids.dim() != 2 or ids.shape[0] != 1:
+        raise ValueError("expected input_ids shape (1, L)")
+    L = int(ids.shape[1])
+    cfg = getattr(model, "config", None)
+    v = int(cfg.vocab_size) if cfg is not None else int(getattr(model, "vocab_size"))
+    if L < 2:
+        return (
+            torch.empty(0, v, device=device, dtype=torch.float32),
+            torch.empty(0, dtype=torch.long, device=device),
+        )
+
+    quant_cache = quantized_kv_cache_for_model(model)
+    logits_chunks: list[torch.Tensor] = []
+    past = None
+
+    for t in range(L - 1):
+        step_ids = ids[:, t : t + 1]
+        if t == 0:
+            if quant_cache is None:
+                out = model(input_ids=step_ids, use_cache=True)
+                past = out.past_key_values
+            else:
+                out = model(input_ids=step_ids, use_cache=True, past_key_values=quant_cache)
+                past = quant_cache
+        else:
+            out = model(input_ids=step_ids, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+        logits_chunks.append(out.logits[:, -1, :])
+
+    logits = torch.cat(logits_chunks, dim=0).float()
+    targets = ids[0, 1:L].long()
+    return logits, targets
+
 
 def effective_max_context(model: GPT2LMHeadModel, max_context_tokens: int | None) -> int:
     cap = int(model.config.n_positions)
@@ -51,9 +106,7 @@ def greedy_generate_with_cache(
     """Prefill input_ids (1, seq), then greedy decode max_new_tokens steps. Returns (1, max_new_tokens)."""
     model.eval()
     ids = input_ids.to(device)
-    attn0 = getattr(getattr(model, "transformer", None), "h", [None])[0]
-    quant_group_size = getattr(getattr(attn0, "attn", None), "quant_group_size", None)
-    quant_cache = QuantizedKVCache(group_size=int(quant_group_size)) if quant_group_size is not None else None
+    quant_cache = quantized_kv_cache_for_model(model)
 
     if quant_cache is None:
         out = model(input_ids=ids, use_cache=True)

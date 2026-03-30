@@ -42,31 +42,38 @@ def test_build_passkey_prompt_shape():
     assert ids.shape[1] <= 1024
 
 
-class _ToyLM(torch.nn.Module):
-    """Next-token logits favor the true target (low ECE)."""
+class _IncrementalCalibToy(torch.nn.Module):
+    """Teacher-forced steps: each (1,1) forward predicts the next token in a fixed sequence."""
 
-    def __init__(self, vocab_size: int):
+    def __init__(self, vocab_size: int, full_ids: torch.Tensor):
         super().__init__()
         self.vocab_size = vocab_size
+        self.register_buffer("full_ids", full_ids.long())
+        self._t = 0
+        self._dummy_past = object()
 
-    def forward(self, input_ids, **kwargs):
-        b, t = input_ids.shape
+    def forward(self, input_ids, past_key_values=None, use_cache=True, **kwargs):
+        assert input_ids.shape == (1, 1)
+        assert int(input_ids[0, 0].item()) == int(self.full_ids[0, self._t].item())
         v = self.vocab_size
-        logits = torch.full((b, t, v), -30.0, dtype=torch.float32)
-        for i in range(t - 1):
-            tgt = int(input_ids[0, i + 1].item())
+        logits = torch.full((1, 1, v), -30.0, device=input_ids.device, dtype=torch.float32)
+        if self._t + 1 < self.full_ids.shape[1]:
+            tgt = int(self.full_ids[0, self._t + 1].item())
             if 0 <= tgt < v:
-                logits[0, i, tgt] = 20.0
-        return SimpleNamespace(logits=logits)
+                logits[0, 0, tgt] = 20.0
+        self._t += 1
+        return SimpleNamespace(logits=logits, past_key_values=self._dummy_past)
 
 
 def test_compute_lm_ece_near_zero_on_perfect_toy():
     tok = GPT2Tokenizer.from_pretrained("gpt2")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = _ToyLM(tok.vocab_size)
-    model.eval()
     texts = ["Hello world, this is a short calibration line."]
+    enc = tok(texts[0], truncation=True, max_length=32, return_tensors="pt", add_special_tokens=True)
+    full_ids = enc["input_ids"]
+    model = _IncrementalCalibToy(tok.vocab_size, full_ids)
+    model.eval()
     ece, n = compute_lm_ece(model, tok, texts, torch.device("cpu"), max_length=32, num_bins=10)
     assert n > 0
     assert ece < 0.05
