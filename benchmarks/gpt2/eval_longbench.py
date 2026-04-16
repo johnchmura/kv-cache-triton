@@ -12,7 +12,7 @@ from datasets import load_dataset
 from huggingface_hub import hf_hub_download
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-from benchmarks.eval_common import effective_max_context, greedy_generate_with_cache, truncate_context_keep_query_tail
+from benchmarks.gpt2.eval_common import effective_max_context, greedy_generate_with_cache, truncate_context_keep_query_tail
 
 _LONGBENCH_ZIP_PATH: str | None = None
 

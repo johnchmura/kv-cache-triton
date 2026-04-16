@@ -10,8 +10,8 @@ import pytest
 import torch
 from transformers import GPT2LMHeadModel
 
-from models import gpt2_triton
-from models.gpt2_triton import replace_gpt2_attention_with_triton
+from models.gpt2 import gpt2_triton
+from models.gpt2.gpt2_triton import replace_gpt2_attention_with_triton
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

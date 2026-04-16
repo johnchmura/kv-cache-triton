@@ -27,17 +27,17 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from benchmarks.eval_calibration import compute_lm_ece, load_calibration_texts
-from benchmarks.eval_common import PPL_ECE_EVAL_MODE, teacher_forced_incremental_logits
-from benchmarks.eval_longbench import run_longbench_eval
-from benchmarks.eval_passkey import run_passkey_eval
-from benchmarks.kv_cache_metrics import (
+from benchmarks.gpt2.eval_calibration import compute_lm_ece, load_calibration_texts
+from benchmarks.gpt2.eval_common import PPL_ECE_EVAL_MODE, teacher_forced_incremental_logits
+from benchmarks.gpt2.eval_longbench import run_longbench_eval
+from benchmarks.gpt2.eval_passkey import run_passkey_eval
+from benchmarks.gpt2.kv_cache_metrics import (
     kv_cache_storage_nbytes,
     microbench_hf_kv_update_ms_per_decode_step,
     microbench_quant_kv_append_ms_per_decode_step,
 )
-from models.gpt2_quant import replace_gpt2_attention_with_quantized
-from models.kv_cache import QuantizedKVCache
+from models.gpt2.gpt2_quant import replace_gpt2_attention_with_quantized
+from models.gpt2.kv_cache import QuantizedKVCache
 
 DEFAULT_MODELS = ["gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"]
 DEFAULT_LONGBENCH_SUBSETS = ["narrativeqa", "triviaqa"]

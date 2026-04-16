@@ -4,8 +4,8 @@ import pytest
 import torch
 from transformers import GPT2LMHeadModel
 
-from models.gpt2_quant import replace_gpt2_attention_with_quantized
-from models.kv_cache import QuantizedKVCache
+from models.gpt2.gpt2_quant import replace_gpt2_attention_with_quantized
+from models.gpt2.kv_cache import QuantizedKVCache
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

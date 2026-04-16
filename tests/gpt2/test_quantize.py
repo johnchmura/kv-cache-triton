@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from kernels.quantize import dequantize_int4, quantize_int4
+from kernels.gpt2.quantize import dequantize_int4, quantize_int4
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

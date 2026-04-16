@@ -8,7 +8,7 @@ import torch
 from datasets import load_dataset
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-from benchmarks.eval_common import teacher_forced_incremental_logits
+from benchmarks.gpt2.eval_common import teacher_forced_incremental_logits
 
 
 def load_calibration_texts(

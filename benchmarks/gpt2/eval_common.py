@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-from models.kv_cache import QuantizedKVCache
+from models.gpt2.kv_cache import QuantizedKVCache
 
 PPL_ECE_EVAL_MODE = "teacher_forced_incremental_kv"
 

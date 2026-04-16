@@ -10,7 +10,7 @@ from typing import Literal
 import torch
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-from benchmarks.eval_common import effective_max_context, greedy_generate_with_cache
+from benchmarks.gpt2.eval_common import effective_max_context, greedy_generate_with_cache
 
 FILLER_UNIT = (
     "Lorem ipsum dolor sit amet consectetur adipiscing elit. "

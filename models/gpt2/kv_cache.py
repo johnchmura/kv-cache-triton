@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from kernels.quantize import dequantize_int4, quantize_int4
+from kernels.gpt2.quantize import dequantize_int4, quantize_int4
 
 
 @dataclass

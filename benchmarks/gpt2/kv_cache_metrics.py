@@ -8,7 +8,7 @@ import torch
 from transformers.cache_utils import DynamicCache
 from transformers import PretrainedConfig
 
-from models.kv_cache import QuantizedKVCache
+from models.gpt2.kv_cache import QuantizedKVCache
 
 
 def tensor_storage_nbytes(t: torch.Tensor) -> int:

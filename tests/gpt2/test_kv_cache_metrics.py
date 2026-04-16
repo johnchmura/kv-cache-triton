@@ -5,13 +5,13 @@ import torch
 from transformers import GPT2Config
 from transformers.cache_utils import DynamicCache
 
-from benchmarks.kv_cache_metrics import (
+from benchmarks.gpt2.kv_cache_metrics import (
     kv_cache_storage_nbytes,
     microbench_hf_kv_update_ms_per_decode_step,
     microbench_quant_kv_append_ms_per_decode_step,
     tensor_storage_nbytes,
 )
-from models.kv_cache import QuantizedKVCache, _LayerQuantizedKV
+from models.gpt2.kv_cache import QuantizedKVCache, _LayerQuantizedKV
 
 
 def test_kv_cache_storage_nbytes_none():

@@ -5,13 +5,13 @@ from types import SimpleNamespace
 import torch
 from transformers import GPT2Tokenizer
 
-from benchmarks.eval_calibration import compute_lm_ece
-from benchmarks.eval_longbench import (
+from benchmarks.gpt2.eval_calibration import compute_lm_ece
+from benchmarks.gpt2.eval_longbench import (
     longbench_substring_hit,
     normalize_answers,
     row_to_context_query,
 )
-from benchmarks.eval_passkey import build_passkey_prompt
+from benchmarks.gpt2.eval_passkey import build_passkey_prompt
 
 
 def test_normalize_answers_json_list():
