@@ -12,7 +12,7 @@ from datasets import load_dataset
 from huggingface_hub import hf_hub_download
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-from benchmarks.eval_common import effective_max_context, greedy_generate_with_cache, truncate_context_keep_query_tail
+from benchmarks.gpt2.eval_common import effective_max_context, greedy_generate_with_cache, truncate_context_keep_query_tail
 
 _LONGBENCH_ZIP_PATH: str | None = None
 
@@ -69,7 +69,7 @@ def row_to_context_query(row: dict[str, Any]) -> tuple[str, str]:
 class LongBenchSubsetResult:
     subset: str
     hit_rate_ref: float
-    hit_rate_triton: float
+    hit_rate_quant: float
     greedy_parity_rate: float
     n_evaluated: int
     truncated: bool
@@ -80,7 +80,7 @@ class LongBenchSubsetResult:
 class LongBenchAggregate:
     results: list[LongBenchSubsetResult]
     hit_rate_ref_mean: float
-    hit_rate_triton_mean: float
+    hit_rate_quant_mean: float
     greedy_parity_rate_mean: float
     longbench_truncated: bool
     longbench_prompt_token_cap: int
@@ -88,7 +88,7 @@ class LongBenchAggregate:
 
 def _eval_subset(
     model_ref: GPT2LMHeadModel,
-    model_tr: GPT2LMHeadModel,
+    model_quant: GPT2LMHeadModel,
     tokenizer: GPT2Tokenizer,
     device: torch.device,
     subset: str,
@@ -99,7 +99,7 @@ def _eval_subset(
     ds = load_longbench_subset(subset)
     truncated_flag = False
     hits_r = 0
-    hits_t = 0
+    hits_q = 0
     parity = 0
     n = 0
     for i, row in enumerate(ds):
@@ -118,18 +118,18 @@ def _eval_subset(
             truncated_flag = True
         elif ids_r.shape[1] >= prompt_cap:
             truncated_flag = True
-        ids_t = ids_r.clone()
+        ids_q = ids_r.clone()
 
         gen_r = greedy_generate_with_cache(model_ref, ids_r, max_new_tokens, device)
-        gen_t = greedy_generate_with_cache(model_tr, ids_t, max_new_tokens, device)
+        gen_q = greedy_generate_with_cache(model_quant, ids_q, max_new_tokens, device)
         text_r = tokenizer.decode(gen_r[0], skip_special_tokens=True)
-        text_t = tokenizer.decode(gen_t[0], skip_special_tokens=True)
+        text_q = tokenizer.decode(gen_q[0], skip_special_tokens=True)
 
         if longbench_substring_hit(text_r, answers):
             hits_r += 1
-        if longbench_substring_hit(text_t, answers):
-            hits_t += 1
-        if torch.equal(gen_r.cpu(), gen_t.cpu()):
+        if longbench_substring_hit(text_q, answers):
+            hits_q += 1
+        if torch.equal(gen_r.cpu(), gen_q.cpu()):
             parity += 1
         n += 1
 
@@ -139,7 +139,7 @@ def _eval_subset(
     return LongBenchSubsetResult(
         subset=subset,
         hit_rate_ref=rate(hits_r, n),
-        hit_rate_triton=rate(hits_t, n),
+        hit_rate_quant=rate(hits_q, n),
         greedy_parity_rate=rate(parity, n),
         n_evaluated=n,
         truncated=truncated_flag,
@@ -149,7 +149,7 @@ def _eval_subset(
 
 def run_longbench_eval(
     model_ref: GPT2LMHeadModel,
-    model_tr: GPT2LMHeadModel,
+    model_quant: GPT2LMHeadModel,
     tokenizer: GPT2Tokenizer,
     device: torch.device,
     *,
@@ -167,7 +167,7 @@ def run_longbench_eval(
     for sub in subsets:
         r = _eval_subset(
             model_ref,
-            model_tr,
+            model_quant,
             tokenizer,
             device,
             sub,
@@ -181,7 +181,7 @@ def run_longbench_eval(
         return LongBenchAggregate(
             results=[],
             hit_rate_ref_mean=0.0,
-            hit_rate_triton_mean=0.0,
+            hit_rate_quant_mean=0.0,
             greedy_parity_rate_mean=0.0,
             longbench_truncated=False,
             longbench_prompt_token_cap=prompt_cap,
@@ -194,7 +194,7 @@ def run_longbench_eval(
     return LongBenchAggregate(
         results=results,
         hit_rate_ref_mean=mean_attr("hit_rate_ref"),
-        hit_rate_triton_mean=mean_attr("hit_rate_triton"),
+        hit_rate_quant_mean=mean_attr("hit_rate_quant"),
         greedy_parity_rate_mean=mean_attr("greedy_parity_rate"),
         longbench_truncated=any_trunc,
         longbench_prompt_token_cap=prompt_cap,

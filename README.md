@@ -4,11 +4,11 @@ Triton kernels for attention-related workloads (Phase 1: synthetic tensors; late
 
 ## Layout
 
-- `kernels/` — Triton kernels (e.g. `attention.py`)
-- `tests/` — correctness tests
-- `benchmarks/` — GPT-2 reference vs Triton scripts and run logs
+- `kernels/` — Triton kernels (GPT-2 lives in `kernels/gpt2/`)
+- `tests/` — test suites grouped by model family (GPT-2 lives in `tests/gpt2/`)
+- `benchmarks/` — benchmark suites grouped by model family (GPT-2 lives in `benchmarks/gpt2/`)
 - `experiments/` — notebooks or scripts (reserved)
-- `models/` — future LLaMA integration (reserved)
+- `models/` — model glue code grouped by model family (GPT-2 lives in `models/gpt2/`)
 - `utils/` — shared helpers (reserved)
 
 ## Phase 1
@@ -26,7 +26,7 @@ Requires CUDA for the kernel and tests.
 ## Run tests
 
 ```bash
-pytest tests/test_attention.py -v
+pytest tests/gpt2/test_attention.py -v
 ```
 
 ## Smoke run
@@ -39,10 +39,10 @@ Prints the max absolute difference versus PyTorch SDPA on fixed small shapes.
 
 ## Benchmarks
 
-Compares Hugging Face GPT-2 attention with the Triton-patched model (decode steps). Downloads checkpoints, WikiText-2, and (when enabled) LongBench `data.zip` / streaming calibration data on first run (requires network).
+Compares Hugging Face GPT-2 reference attention with the quantized KV cache / attention path (decode steps, storage, and optional evals). Downloads checkpoints, WikiText-2, and (when enabled) LongBench `data.zip` / streaming calibration data on first run (requires network).
 
 ```bash
-python -m benchmarks.run_gpt2_benchmark
+python -m benchmarks.gpt2.run_gpt2_benchmark
 ```
 
 By default this runs **gpt2**, **gpt2-medium**, **gpt2-large**, and **gpt2-xl** in order. Use `--models` to limit or reorder, e.g. `--models gpt2 gpt2-large`. Larger checkpoints need more VRAM; if a size fails (for example CUDA OOM), use `--continue-on-error` to finish the remaining models and record failures in `run_summary.json` and per-model `error.json`.

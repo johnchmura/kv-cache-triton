@@ -5,7 +5,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from kernels.attention import attention_forward
+from kernels.gpt2.attention import attention_forward
 
 
 def main() -> None:

@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from kernels.attention import attention_forward
+from kernels.gpt2.attention import attention_forward
 
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
