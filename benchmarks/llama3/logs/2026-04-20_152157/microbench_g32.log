@@ -1,0 +1,8 @@
+[s=   512] kv_bf16=   2.00 MiB kv_int4=   0.56 MiB (3.56x)  bf16=  0.05 ms  fused=  0.06 ms  speedup=0.75x
+[s=  1024] kv_bf16=   4.00 MiB kv_int4=   1.12 MiB (3.56x)  bf16=  0.05 ms  fused=  0.12 ms  speedup=0.40x
+[s=  2048] kv_bf16=   8.00 MiB kv_int4=   2.25 MiB (3.56x)  bf16=  0.07 ms  fused=  0.24 ms  speedup=0.30x
+[s=  4096] kv_bf16=  16.00 MiB kv_int4=   4.50 MiB (3.56x)  bf16=  0.18 ms  fused=  0.49 ms  speedup=0.36x
+[s=  8192] kv_bf16=  32.00 MiB kv_int4=   9.00 MiB (3.56x)  bf16=  0.37 ms  fused=  0.99 ms  speedup=0.37x
+[s= 16384] kv_bf16=  64.00 MiB kv_int4=  18.00 MiB (3.56x)  bf16=  0.72 ms  fused=  1.98 ms  speedup=0.36x
+[s= 32768] kv_bf16= 128.00 MiB kv_int4=  36.00 MiB (3.56x)  bf16=  1.35 ms  fused=  3.42 ms  speedup=0.39x
+[info] wrote benchmarks/llama3/logs/2026-04-20_152157/microbench_g32

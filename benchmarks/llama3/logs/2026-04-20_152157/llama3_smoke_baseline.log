@@ -1,0 +1,18 @@
+[info] device: NVIDIA GeForce RTX 4070
+[info] loading tokenizer for meta-llama/Llama-3.1-8B
+[info] loading model in BF16 (quant-kv=False, group_size=32)
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:04<00:12,  4.13s/it]Loading checkpoint shards:  50%|█████     | 2/4 [00:08<00:08,  4.06s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:08<00:00,  2.05s/it]
+Some parameters are on the meta device because they were offloaded to the cpu.
+The following generation flags are not valid and may be ignored: ['temperature', 'top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+Setting `pad_token_id` to `eos_token_id`:128001 for open-end generation.
+num_attention_heads (n_q): 32
+num_key_value_heads (n_kv): 8
+hidden_size: 4096
+head_dim: 128
+GQA repeat factor: 4
+[info] load complete in 8.7s, peak VRAM 8.70 GiB
+[info] prompt tokens: 6
+[info] generated 8 tokens in 15.15s (0.5 tok/s)
+[info] peak VRAM after generate: 9.69 GiB
+---
+The capital of France is a city of many faces. It is
