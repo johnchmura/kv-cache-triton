@@ -40,8 +40,21 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from benchmarks.llama3.eval_longbench import run_longbench_eval
-from benchmarks.llama3.eval_passkey import run_passkey_eval
+from benchmarks.llama3.eval_longbench import (
+    build_longbench_examples,
+    longbench_sweep_points_to_dict,
+    run_longbench_branch,
+    run_longbench_eval,
+    run_longbench_sweep,
+)
+from benchmarks.llama3.eval_passkey import (
+    load_ruler_niah_samples,
+    passkey_sweep_points_to_dict,
+    run_passkey_branch,
+    run_passkey_eval,
+    run_passkey_sweep,
+)
+from benchmarks.llama3.bench_log import BenchLogger
 from benchmarks.llama3.kv_cache_metrics import kv_cache_nbytes
 from models.llama3.kernel_variant import bind_quantized_kernel_variant, resolve_kernel_variant
 from models.llama3.kv_cache import QuantizedKVCache
@@ -283,6 +296,34 @@ def _plot_cross_models(
     plt.close(fig)
 
 
+def _plot_cross_length_multi(
+    path: Path,
+    title: str,
+    ylabel: str,
+    rows: list[dict[str, Any]],
+    *,
+    x_name: str,
+    y_name: str,
+    ref_key: str,
+    quant_key: str,
+) -> None:
+    pts = []
+    for r in rows:
+        if ref_key not in r or quant_key not in r:
+            continue
+        x = r.get(x_name)
+        if x is None:
+            x = r.get("x_value")
+        try:
+            x = int(x)
+            a = float(r[ref_key])
+            b = float(r[quant_key])
+        except Exception:
+            continue
+        pts.append((x, a, b))
+    _plot_cross_length(path, title, ylabel, pts)
+
+
 def _write_length_artifacts(out_dir: Path, metrics: dict[str, Any]) -> None:
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, default=str)
@@ -386,6 +427,7 @@ def run_one_model(
     model_slug = _model_slug(model_id)
     model_dir = out_root / model_slug
     model_dir.mkdir(parents=True, exist_ok=True)
+    logger = BenchLogger(model_dir)
 
     print(f"[info] === model: {model_id} ===")
     print(f"[info] loading tokenizer {model_id}")
@@ -410,18 +452,74 @@ def run_one_model(
         "load_seconds": load_s,
         "prefill_lens": list(args.prefill_lens),
     }
+    logger.write_config(model_summary)
+
+    # Per-model progress tracker (one line with ETA).
+    passkey_sweep_tokens = list(getattr(args, "passkey_haystack_sweep", []) or [])
+    longbench_ctx_sweep = list(getattr(args, "longbench_context_sweep", []) or [])
+    ppl_sweep_lens = list(getattr(args, "ppl_max_seq_len_sweep", []) or [])
+    if not ppl_sweep_lens and args.ppl_max_seq_len:
+        ppl_sweep_lens = [int(args.ppl_max_seq_len)]
+
+    n_prefill = len(list(args.prefill_lens))
+    n_ppl = len(ppl_sweep_lens) if args.ppl_samples > 0 else 0
+    n_passkey = len(passkey_sweep_tokens) if args.passkey_samples > 0 else 0
+    n_longbench = (len(longbench_ctx_sweep) * len(longbench_subsets)) if (longbench_subsets and args.longbench_max_samples > 0) else 0
+    total_steps = 2 * n_prefill + 2 * n_ppl + 2 * n_passkey + 2 * n_longbench
+    done_steps = 0
+    t_start = time.perf_counter()
+    last_print_t = 0.0
+
+    def _fmt_mmss(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        m = int(seconds // 60.0)
+        s = int(seconds - 60.0 * m)
+        return f"{m:02d}:{s:02d}"
+
+    def progress(stage: str, *, force: bool = False) -> None:
+        nonlocal last_print_t
+        now = time.perf_counter()
+        if not force and (now - last_print_t) < 1.0:
+            return
+        last_print_t = now
+        if total_steps <= 0:
+            return
+        elapsed = max(1e-6, now - t_start)
+        rate = done_steps / elapsed
+        remaining = max(0, total_steps - done_steps)
+        eta = remaining / rate if rate > 0 else float("inf")
+        pct = 100.0 * float(done_steps) / float(total_steps)
+        eta_s = _fmt_mmss(eta) if eta != float("inf") else "--:--"
+        print(f"[progress] {model_slug} {done_steps}/{total_steps} ({pct:.1f}%) ETA={eta_s} stage={stage}")
 
     ref_runs: dict[int, dict] = {}
 
     print("[info] --- reference pass (stock DynamicCache, BF16 KV) ---")
     ppl_ref = None
-    if texts:
-        print(f"[info] computing reference PPL on {len(texts)} WikiText-2 rows")
-        ppl_ref = _compute_ppl(
-            model, tokenizer, texts, args.ppl_max_seq_len,
-            max_batches=args.ppl_samples, quantized=False, group_size=args.group_size,
-        )
-        print(f"[info] ref PPL: {ppl_ref:.3f}")
+    ppl_sweep_ref: list[dict[str, Any]] = []
+    if texts and ppl_sweep_lens:
+        print(f"[info] computing reference PPL sweep at max_seq_len={ppl_sweep_lens}")
+        for max_len in ppl_sweep_lens:
+            v = _compute_ppl(
+                model, tokenizer, texts, int(max_len),
+                max_batches=args.ppl_samples, quantized=False, group_size=args.group_size,
+            )
+            ppl_sweep_ref.append({"max_seq_len": int(max_len), "ppl": float(v)})
+            logger.log(
+                {
+                    "run_timestamp": ts,
+                    "model": model_id,
+                    "model_slug": model_slug,
+                    "branch": "reference",
+                    "metric_family": "ppl_sweep",
+                    "x_name": "max_seq_len",
+                    "x_value": int(max_len),
+                    "ppl": float(v),
+                }
+            )
+            done_steps += 1
+            progress(f"ppl_ref max_len={max_len}")
+        ppl_ref = ppl_sweep_ref[-1]["ppl"]
 
     for L in args.prefill_lens:
         print(f"[info] [ref]  benchmarking prefill_len={L}")
@@ -430,18 +528,111 @@ def run_one_model(
         except Exception as e:
             print(f"[error] [ref]  prefill_len={L} failed: {e}")
             ref_runs[L] = {"error": str(e)}
+            done_steps += 1
+            progress(f"decode_ref prefill_len={L} error", force=True)
+        else:
+            done_steps += 1
+            progress(f"decode_ref prefill_len={L}")
+
+    # Retrieval evals on the true baseline attention path (pre-swap).
+    passkey_ref_by_x: dict[int, dict[str, Any]] = {}
+    longbench_ref_by_x: dict[int, dict[str, Any]] = {}
+
+    if args.passkey_samples > 0 and passkey_sweep_tokens:
+        print(f"[info] RULER NIAH passkey sweep (baseline) ctx_tokens={passkey_sweep_tokens} x {args.passkey_samples}")
+        try:
+            for ctx_tokens in passkey_sweep_tokens:
+                samples = load_ruler_niah_samples(
+                    tokenizer,
+                    context_tokens=int(ctx_tokens),
+                    n_samples=int(args.passkey_samples),
+                    seed=int(args.seed + 7),
+                )
+                ref_res = run_passkey_branch(
+                    model,
+                    tokenizer,
+                    _input_device(model),
+                    samples,
+                    cache_kind="dynamic",
+                    group_size=args.group_size,
+                    max_new_tokens=16,
+                    quant_cache_cls=QuantizedKVCache,
+                )
+                passkey_ref_by_x[int(ctx_tokens)] = {
+                    "samples": samples,
+                    "results": ref_res,
+                }
+                done_steps += 1
+                progress(f"passkey_ref ctx_tokens={ctx_tokens}")
+        except Exception as e:
+            print(f"[error] passkey baseline sweep failed: {e}")
+            done_steps += 1
+            progress("passkey_ref error", force=True)
+
+    if longbench_subsets and args.longbench_max_samples > 0 and longbench_ctx_sweep:
+        print(f"[info] longbench sweep (baseline) ctx_tokens={longbench_ctx_sweep} subsets={longbench_subsets}")
+        try:
+            for max_ctx in longbench_ctx_sweep:
+                per_subset_examples: dict[str, list[Any]] = {}
+                for subset in longbench_subsets:
+                    per_subset_examples[subset] = build_longbench_examples(
+                        tokenizer,
+                        subset=subset,
+                        max_samples=int(args.longbench_max_samples),
+                        max_context_tokens=int(max_ctx),
+                    )
+                # Run baseline branch over all examples.
+                per_subset_ref: dict[str, list[Any]] = {}
+                for subset, exs in per_subset_examples.items():
+                    per_subset_ref[subset] = run_longbench_branch(
+                        model,
+                        tokenizer,
+                        _input_device(model),
+                        exs,
+                        cache_kind="dynamic",
+                        group_size=args.group_size,
+                        max_new_tokens=int(args.longbench_max_new_tokens),
+                        quant_cache_cls=QuantizedKVCache,
+                    )
+                    done_steps += 1
+                    progress(f"longbench_ref ctx={max_ctx} subset={subset}")
+                longbench_ref_by_x[int(max_ctx)] = {
+                    "examples": per_subset_examples,
+                    "results": per_subset_ref,
+                }
+        except Exception as e:
+            print(f"[error] longbench baseline sweep failed: {e}")
+            done_steps += 1
+            progress("longbench_ref error", force=True)
 
     print("[info] --- swapping attention modules to quantized INT4 path ---")
     replace_llama_attention_with_quantized(model, group_size=args.group_size)
 
     ppl_q = None
-    if texts:
-        print(f"[info] computing quantized PPL")
-        ppl_q = _compute_ppl(
-            model, tokenizer, texts, args.ppl_max_seq_len,
-            max_batches=args.ppl_samples, quantized=True, group_size=args.group_size,
-        )
-        print(f"[info] quant PPL: {ppl_q:.3f}")
+    ppl_sweep_quant: list[dict[str, Any]] = []
+    if texts and ppl_sweep_lens:
+        print(f"[info] computing quantized PPL sweep")
+        for max_len in ppl_sweep_lens:
+            v = _compute_ppl(
+                model, tokenizer, texts, int(max_len),
+                max_batches=args.ppl_samples, quantized=True, group_size=args.group_size,
+            )
+            ppl_sweep_quant.append({"max_seq_len": int(max_len), "ppl": float(v)})
+            logger.log(
+                {
+                    "run_timestamp": ts,
+                    "model": model_id,
+                    "model_slug": model_slug,
+                    "branch": "quant",
+                    "metric_family": "ppl_sweep",
+                    "x_name": "max_seq_len",
+                    "x_value": int(max_len),
+                    "ppl": float(v),
+                }
+            )
+            done_steps += 1
+            progress(f"ppl_quant max_len={max_len}")
+        ppl_q = ppl_sweep_quant[-1]["ppl"]
 
     q_runs: dict[int, dict] = {}
     for L in args.prefill_lens:
@@ -451,6 +642,11 @@ def run_one_model(
         except Exception as e:
             print(f"[error] [quant] prefill_len={L} failed: {e}")
             q_runs[L] = {"error": str(e)}
+            done_steps += 1
+            progress(f"decode_quant prefill_len={L} error", force=True)
+        else:
+            done_steps += 1
+            progress(f"decode_quant prefill_len={L}")
 
     cross: list[tuple[int, float, float]] = []
     cross_kv: list[tuple[int, float, float]] = []
@@ -481,6 +677,17 @@ def run_one_model(
             "ppl_quant": ppl_q,
         })
         _write_length_artifacts(per_len_dir, metrics)
+        logger.log(
+            {
+                "run_timestamp": ts,
+                "model": model_id,
+                "model_slug": model_slug,
+                "metric_family": "prefill_decode",
+                "x_name": "prefill_len",
+                "x_value": int(L),
+                **metrics,
+            }
+        )
         cross.append((L, metrics["ref_decode_ms_per_token"], metrics["quant_decode_ms_per_token"]))
         cross_kv.append((L, metrics["ref_kv_cache_mib"], metrics["quant_kv_cache_mib"]))
         cross_vram.append((L, metrics["ref_peak_cuda_mib"], metrics["quant_peak_cuda_mib"]))
@@ -492,48 +699,234 @@ def run_one_model(
         )
 
     passkey_summary: dict | None = None
+    passkey_sweep: list[dict[str, Any]] | None = None
     longbench_summary: dict | None = None
+    longbench_sweep: list[dict[str, Any]] | None = None
 
-    if args.passkey_samples > 0:
-        print(f"[info] passkey eval x {args.passkey_samples}  (note: shares one swapped model for both paths)")
+    # Two-phase retrieval: run quant branch now and merge with stored baseline results.
+    if args.passkey_samples > 0 and passkey_sweep_tokens and passkey_ref_by_x:
+        print(f"[info] RULER NIAH passkey sweep (quant) ctx_tokens={passkey_sweep_tokens}")
         try:
-            pk = run_passkey_eval(
-                model, model, tokenizer, _input_device(model),
-                group_size=args.group_size,
-                n_samples=args.passkey_samples,
-                passkey_len=args.passkey_len,
-                haystack_tokens=args.passkey_haystack_tokens,
-                seed=args.seed + 7,
-            )
-            passkey_summary = asdict(pk)
-            with open(model_dir / "passkey.json", "w", encoding="utf-8") as f:
-                json.dump(passkey_summary, f, indent=2)
+            pts: list[dict[str, Any]] = []
+            for ctx_tokens in passkey_sweep_tokens:
+                ref_blob = passkey_ref_by_x.get(int(ctx_tokens))
+                if not ref_blob:
+                    continue
+                samples = ref_blob["samples"]
+                ref_res = {r.sample_id: r for r in ref_blob["results"]}
+                quant_res_list = run_passkey_branch(
+                    model,
+                    tokenizer,
+                    _input_device(model),
+                    samples,
+                    cache_kind="quant",
+                    group_size=args.group_size,
+                    max_new_tokens=16,
+                    quant_cache_cls=QuantizedKVCache,
+                )
+                hits_ref = 0
+                hits_quant = 0
+                parity = 0
+                total_ctx = 0
+                total_kv = 0.0
+                n = max(1, len(samples))
+                for qr in quant_res_list:
+                    rr = ref_res.get(qr.sample_id)
+                    if rr and rr.hit:
+                        hits_ref += 1
+                    if qr.hit:
+                        hits_quant += 1
+                    if rr and rr.answer_text.strip() == qr.answer_text.strip():
+                        parity += 1
+                    total_ctx += qr.n_in
+                    if qr.kv_mib is not None:
+                        total_kv += float(qr.kv_mib)
+                pt = {
+                    "haystack_tokens": int(ctx_tokens),
+                    "seed": int(args.seed + 7),
+                    "group_size": int(args.group_size),
+                    "passkey_len": int(args.passkey_len),
+                    "max_new_tokens": 16,
+                    "n_samples": int(len(samples)),
+                    "exact_match_rate_ref": hits_ref / n,
+                    "exact_match_rate_quant": hits_quant / n,
+                    "greedy_parity_rate": parity / n,
+                    "avg_context_tokens": total_ctx / n,
+                    "avg_quant_kv_mib": total_kv / n,
+                    "dataset": "ruler_niah",
+                }
+                pts.append(pt)
+                done_steps += 1
+                progress(f"passkey_quant ctx_tokens={ctx_tokens}")
+            passkey_sweep = pts
+            with open(model_dir / "passkey_sweep.json", "w", encoding="utf-8") as f:
+                json.dump({"points": passkey_sweep}, f, indent=2, default=str)
+            for p in passkey_sweep:
+                logger.log(
+                    {
+                        "run_timestamp": ts,
+                        "model": model_id,
+                        "model_slug": model_slug,
+                        "metric_family": "passkey_sweep",
+                        "x_name": "haystack_tokens",
+                        "x_value": int(p["haystack_tokens"]),
+                        **p,
+                    }
+                )
         except Exception as e:
-            print(f"[error] passkey eval failed: {e}")
+            print(f"[error] passkey two-phase sweep failed: {e}")
+            done_steps += 1
+            progress("passkey_quant error", force=True)
 
-    if longbench_subsets and args.longbench_max_samples > 0:
-        print(f"[info] longbench eval subsets={longbench_subsets}")
+    if longbench_subsets and args.longbench_max_samples > 0 and longbench_ctx_sweep and longbench_ref_by_x:
+        print(f"[info] longbench sweep (quant) ctx_tokens={longbench_ctx_sweep} subsets={longbench_subsets}")
         try:
-            lb = run_longbench_eval(
-                model, model, tokenizer, _input_device(model),
-                group_size=args.group_size,
-                subsets=longbench_subsets,
-                max_samples_per_subset=args.longbench_max_samples,
-                max_context_tokens=args.longbench_max_context_tokens,
-                max_new_tokens=args.longbench_max_new_tokens,
-            )
-            longbench_summary = {
-                "hit_rate_ref_mean": lb.hit_rate_ref_mean,
-                "hit_rate_quant_mean": lb.hit_rate_quant_mean,
-                "greedy_parity_rate_mean": lb.greedy_parity_rate_mean,
-                "results": [asdict(r) for r in lb.results],
-                "max_context_tokens": lb.max_context_tokens,
-                "max_new_tokens": lb.max_new_tokens,
-            }
-            with open(model_dir / "longbench.json", "w", encoding="utf-8") as f:
-                json.dump(longbench_summary, f, indent=2)
+            pts: list[dict[str, Any]] = []
+            for max_ctx in longbench_ctx_sweep:
+                ref_blob = longbench_ref_by_x.get(int(max_ctx))
+                if not ref_blob:
+                    continue
+                examples_by_subset = ref_blob["examples"]
+                ref_by_subset = ref_blob["results"]
+                by_subset_out: dict[str, dict[str, Any]] = {}
+                all_ref_rates = []
+                all_quant_rates = []
+                all_parity_rates = []
+                all_ns = []
+                all_ctx = []
+                all_kv = []
+                for subset in longbench_subsets:
+                    exs = examples_by_subset.get(subset, [])
+                    ref_res_list = ref_by_subset.get(subset, [])
+                    ref_map = {(r.subset, r.row_idx): r for r in ref_res_list}
+                    quant_res_list = run_longbench_branch(
+                        model,
+                        tokenizer,
+                        _input_device(model),
+                        exs,
+                        cache_kind="quant",
+                        group_size=args.group_size,
+                        max_new_tokens=int(args.longbench_max_new_tokens),
+                        quant_cache_cls=QuantizedKVCache,
+                    )
+                    hits_ref = 0
+                    hits_quant = 0
+                    parity = 0
+                    total_ctx = 0
+                    total_kv = 0.0
+                    n = max(1, len(exs))
+                    for qr in quant_res_list:
+                        rr = ref_map.get((qr.subset, qr.row_idx))
+                        if rr and rr.hit:
+                            hits_ref += 1
+                        if qr.hit:
+                            hits_quant += 1
+                        if rr and rr.answer_text.strip() == qr.answer_text.strip():
+                            parity += 1
+                        total_ctx += qr.n_in
+                        if qr.kv_mib is not None:
+                            total_kv += float(qr.kv_mib)
+                    by_subset_out[subset] = {
+                        "subset": subset,
+                        "n_samples": int(len(exs)),
+                        "hit_rate_ref": hits_ref / n,
+                        "hit_rate_quant": hits_quant / n,
+                        "greedy_parity_rate": parity / n,
+                        "avg_context_tokens": total_ctx / n,
+                        "avg_quant_kv_mib": total_kv / n,
+                    }
+                    all_ref_rates.append(by_subset_out[subset]["hit_rate_ref"])
+                    all_quant_rates.append(by_subset_out[subset]["hit_rate_quant"])
+                    all_parity_rates.append(by_subset_out[subset]["greedy_parity_rate"])
+                    all_ns.append(int(len(exs)))
+                    all_ctx.append(by_subset_out[subset]["avg_context_tokens"])
+                    all_kv.append(by_subset_out[subset]["avg_quant_kv_mib"])
+                    done_steps += 1
+                    progress(f"longbench_quant ctx={max_ctx} subset={subset}")
+
+                mean = lambda xs: float(sum(xs) / len(xs)) if xs else 0.0
+                total_n = sum(all_ns) or 1
+                weighted = lambda xs: float(sum(float(x) * int(n) for x, n in zip(xs, all_ns)) / total_n) if xs else 0.0
+                pt = {
+                    "max_context_tokens": int(max_ctx),
+                    "max_new_tokens": int(args.longbench_max_new_tokens),
+                    "group_size": int(args.group_size),
+                    "max_samples_per_subset": int(args.longbench_max_samples),
+                    "subsets": list(longbench_subsets),
+                    "hit_rate_ref_mean_subset": mean(all_ref_rates),
+                    "hit_rate_quant_mean_subset": mean(all_quant_rates),
+                    "greedy_parity_rate_mean_subset": mean(all_parity_rates),
+                    "hit_rate_ref_mean_sample": weighted(all_ref_rates),
+                    "hit_rate_quant_mean_sample": weighted(all_quant_rates),
+                    "greedy_parity_rate_mean_sample": weighted(all_parity_rates),
+                    "avg_context_tokens_mean_sample": weighted(all_ctx),
+                    "avg_quant_kv_mib_mean_sample": weighted(all_kv),
+                    "by_subset": by_subset_out,
+                }
+                pts.append(pt)
+            longbench_sweep = pts
+            with open(model_dir / "longbench_sweep.json", "w", encoding="utf-8") as f:
+                json.dump({"points": longbench_sweep}, f, indent=2, default=str)
+            for p in longbench_sweep:
+                logger.log(
+                    {
+                        "run_timestamp": ts,
+                        "model": model_id,
+                        "model_slug": model_slug,
+                        "metric_family": "longbench_sweep",
+                        "x_name": "max_context_tokens",
+                        "x_value": int(p["max_context_tokens"]),
+                        **p,
+                    }
+                )
         except Exception as e:
-            print(f"[error] longbench eval failed: {e}")
+            print(f"[error] longbench two-phase sweep failed: {e}")
+            done_steps += 1
+            progress("longbench_quant error", force=True)
+
+    if texts and ppl_sweep_lens and ppl_sweep_ref and ppl_sweep_quant:
+        with open(model_dir / "ppl_sweep.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {"points": [{"max_seq_len": r["max_seq_len"], "ref_ppl": r["ppl"], "quant_ppl": q["ppl"]}
+                            for r, q in zip(ppl_sweep_ref, ppl_sweep_quant)]},
+                f,
+                indent=2,
+                default=str,
+            )
+        _plot_cross_length_multi(
+            model_dir / "ppl_by_max_seq_len.png",
+            f"{model_slug}: perplexity vs max sequence length",
+            "perplexity (lower is better)",
+            [{"max_seq_len": r["max_seq_len"], "ref": r["ppl"], "quant": q["ppl"]} for r, q in zip(ppl_sweep_ref, ppl_sweep_quant)],
+            x_name="max_seq_len",
+            y_name="ppl",
+            ref_key="ref",
+            quant_key="quant",
+        )
+
+    if passkey_sweep:
+        _plot_cross_length_multi(
+            model_dir / "passkey_hit_rate_by_haystack_tokens.png",
+            f"{model_slug}: passkey exact match vs haystack tokens",
+            "exact match rate",
+            [{"haystack_tokens": p["haystack_tokens"], "ref": p["exact_match_rate_ref"], "quant": p["exact_match_rate_quant"]} for p in passkey_sweep],
+            x_name="haystack_tokens",
+            y_name="exact_match_rate",
+            ref_key="ref",
+            quant_key="quant",
+        )
+
+    if longbench_sweep:
+        _plot_cross_length_multi(
+            model_dir / "longbench_hit_rate_mean_by_context_tokens.png",
+            f"{model_slug}: long retrieval hit rate vs context tokens",
+            "hit rate (mean across subsets)",
+            [{"max_context_tokens": p["max_context_tokens"], "ref": p["hit_rate_ref_mean_subset"], "quant": p["hit_rate_quant_mean_subset"]} for p in longbench_sweep],
+            x_name="max_context_tokens",
+            y_name="hit_rate_mean",
+            ref_key="ref",
+            quant_key="quant",
+        )
 
     _plot_cross_length(
         model_dir / "decode_ms_per_token_by_seqlen.png",
@@ -559,6 +952,13 @@ def run_one_model(
         "ppl_quant": ppl_q,
         "passkey": passkey_summary,
         "longbench": longbench_summary,
+        "ppl_sweep": (
+            [{"max_seq_len": r["max_seq_len"], "ref_ppl": r["ppl"], "quant_ppl": q["ppl"]} for r, q in zip(ppl_sweep_ref, ppl_sweep_quant)]
+            if (ppl_sweep_ref and ppl_sweep_quant)
+            else None
+        ),
+        "passkey_sweep": passkey_sweep,
+        "longbench_sweep": longbench_sweep,
         "cross_decode_ms_per_token": [
             {"prefill_len": L, "ref": a, "quant": b} for (L, a, b) in cross
         ],
@@ -571,6 +971,7 @@ def run_one_model(
     })
     with open(model_dir / "model_summary.json", "w", encoding="utf-8") as f:
         json.dump(model_summary, f, indent=2, default=str)
+    logger.close()
 
     del model
     gc.collect()
@@ -586,6 +987,24 @@ def run_one_model(
         "ppl_quant": ppl_q,
         "passkey": passkey_summary,
         "longbench": longbench_summary,
+        "ppl_sweep": [
+            (int(r["max_seq_len"]), float(r["ppl"]), float(q["ppl"]))
+            for r, q in zip(ppl_sweep_ref, ppl_sweep_quant)
+        ]
+        if (ppl_sweep_ref and ppl_sweep_quant)
+        else None,
+        "passkey_sweep": [
+            (int(p["haystack_tokens"]), float(p["exact_match_rate_ref"]), float(p["exact_match_rate_quant"]))
+            for p in (passkey_sweep or [])
+        ]
+        if passkey_sweep
+        else None,
+        "longbench_sweep": [
+            (int(p["max_context_tokens"]), float(p["hit_rate_ref_mean_subset"]), float(p["hit_rate_quant_mean_subset"]))
+            for p in (longbench_sweep or [])
+        ]
+        if longbench_sweep
+        else None,
     }
 
 
@@ -621,8 +1040,22 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ppl-samples", type=int, default=32)
     parser.add_argument("--ppl-max-seq-len", type=int, default=512)
+    parser.add_argument(
+        "--ppl-max-seq-len-sweep",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Optional sweep of PPL max_seq_len values (e.g. 128 256 512 1024). If provided, PPL is computed for each value.",
+    )
     parser.add_argument("--passkey-samples", type=int, default=0)
     parser.add_argument("--passkey-haystack-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--passkey-haystack-sweep",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Optional sweep of passkey haystack tokens (e.g. 1024 2048 4096 8192).",
+    )
     parser.add_argument("--passkey-len", type=int, default=8)
     parser.add_argument(
         "--longbench-subsets",
@@ -632,6 +1065,13 @@ def main() -> None:
     )
     parser.add_argument("--longbench-max-samples", type=int, default=0)
     parser.add_argument("--longbench-max-context-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--longbench-context-sweep",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Optional sweep of LongBench max_context_tokens (e.g. 2048 4096 8192 16384).",
+    )
     parser.add_argument("--longbench-max-new-tokens", type=int, default=48)
     parser.add_argument("--out-root", type=str, default=None)
     parser.add_argument(
@@ -658,6 +1098,7 @@ def main() -> None:
         f"[info] kernel variant: {kernel_variant}"
         + (" (FP16 boundary, Volta-safe)" if kernel_variant == "sm70" else "")
     )
+    print(f"[info] bound QuantizedKVCache: {QuantizedKVCache.__module__}.{QuantizedKVCache.__name__}")
     # Unmissable routing banner. Silent misconfiguration (benchmark running with
     # an unintended fused path) caused a multi-hour debug loop; always log what
     # the quant attention module captured at import time so the active routing
@@ -682,14 +1123,41 @@ def main() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
 
     cuda_desc = _describe_cuda()
+    root_logger = BenchLogger(out_root)
     print(f"[info] CUDA: {cuda_desc}")
     print(f"[info] writing to {out_root}")
     print(f"[info] models: {model_ids}")
     print(f"[info] prefill lens: {args.prefill_lens}")
 
+    root_logger.write_config(
+        {
+            "timestamp": ts,
+            "cuda_description": cuda_desc,
+            "prefill_lens": list(args.prefill_lens),
+            "group_size": args.group_size,
+            "num_decode_steps": args.num_decode_steps,
+            "seed": args.seed,
+            "ppl_samples": args.ppl_samples,
+            "ppl_max_seq_len": args.ppl_max_seq_len,
+            "passkey_samples": args.passkey_samples,
+            "passkey_haystack_tokens": args.passkey_haystack_tokens,
+            "passkey_len": args.passkey_len,
+            "longbench_subsets": longbench_subsets,
+            "longbench_max_samples": args.longbench_max_samples,
+            "longbench_max_context_tokens": args.longbench_max_context_tokens,
+            "longbench_max_new_tokens": args.longbench_max_new_tokens,
+            "kernel_variant": kernel_variant,
+            "kv_force_dequant_fallback": _fallback,
+            "attention_branch": _branch,
+        }
+    )
+
     per_model_decode: dict[str, list[tuple[int, float, float]]] = {}
     per_model_kv: dict[str, list[tuple[int, float, float]]] = {}
     per_model_vram: dict[str, list[tuple[int, float, float]]] = {}
+    per_model_ppl: dict[str, list[tuple[int, float, float]]] = {}
+    per_model_passkey: dict[str, list[tuple[int, float, float]]] = {}
+    per_model_longbench: dict[str, list[tuple[int, float, float]]] = {}
     completed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 
@@ -721,6 +1189,12 @@ def main() -> None:
             per_model_decode[res["model_slug"]] = res["cross_decode_ms_per_token"]
             per_model_kv[res["model_slug"]] = res["cross_kv_cache_mib"]
             per_model_vram[res["model_slug"]] = res["cross_peak_vram_mib"]
+            if res.get("ppl_sweep"):
+                per_model_ppl[res["model_slug"]] = res["ppl_sweep"]
+            if res.get("passkey_sweep"):
+                per_model_passkey[res["model_slug"]] = res["passkey_sweep"]
+            if res.get("longbench_sweep"):
+                per_model_longbench[res["model_slug"]] = res["longbench_sweep"]
 
     _plot_cross_models(
         out_root / "decode_ms_per_token_by_size.png",
@@ -739,6 +1213,24 @@ def main() -> None:
         "Peak CUDA allocated (sum across GPUs) by model",
         "MiB",
         per_model_vram,
+    )
+    _plot_cross_models(
+        out_root / "ppl_by_model.png",
+        "Perplexity vs max sequence length (BF16 vs INT4 KV)",
+        "perplexity",
+        per_model_ppl,
+    )
+    _plot_cross_models(
+        out_root / "passkey_hit_rate_by_model.png",
+        "Passkey exact match vs haystack tokens (BF16 vs INT4 KV)",
+        "exact match rate",
+        per_model_passkey,
+    )
+    _plot_cross_models(
+        out_root / "longbench_hit_rate_by_model.png",
+        "Long retrieval hit rate vs context tokens (BF16 vs INT4 KV)",
+        "hit rate (mean across subsets)",
+        per_model_longbench,
     )
 
     summary = {
@@ -774,6 +1266,8 @@ def main() -> None:
     print(f"[info] wrote {out_root}")
     if failed:
         print(f"[warn] {len(failed)} model(s) failed: {[f['model'] for f in failed]}")
+    root_logger.log({"run_timestamp": ts, "metric_family": "run_summary", **summary})
+    root_logger.close()
 
 
 if __name__ == "__main__":

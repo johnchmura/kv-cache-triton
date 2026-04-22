@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+# NOTE: kv_cache implementations are kernel-variant dependent (default vs sm70).
+# Avoid hard `isinstance` checks against a single class; prefer capability checks.
 from models.llama3.kv_cache import QuantizedKVCache
 
 
@@ -21,8 +23,17 @@ def kv_cache_nbytes(past) -> int:
     """
     if past is None:
         return 0
+    # Support both default and sm70-bound QuantizedKVCache classes.
+    if hasattr(past, "nbytes") and callable(getattr(past, "nbytes", None)):
+        try:
+            return int(past.nbytes())
+        except Exception:
+            pass
     if isinstance(past, QuantizedKVCache):
-        return past.nbytes()
+        try:
+            return int(past.nbytes())
+        except Exception:
+            return 0
 
     key_cache = getattr(past, "key_cache", None)
     value_cache = getattr(past, "value_cache", None)
