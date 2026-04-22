@@ -31,6 +31,18 @@ DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
 DEFAULT_PROMPT = "The capital of France is"
 
 
+def _num_devices() -> int:
+    return max(1, torch.cuda.device_count())
+
+
+def _peak_gib_all() -> float:
+    return sum(torch.cuda.max_memory_allocated(d) for d in range(_num_devices())) / 1024**3
+
+
+def _alloc_mib_all() -> float:
+    return sum(torch.cuda.memory_allocated(d) for d in range(_num_devices())) / 1024**2
+
+
 def _print_cfg(model) -> None:
     cfg = model.config
     n_q = cfg.num_attention_heads
@@ -58,7 +70,9 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA not available; this smoke test needs a GPU.")
 
-    print(f"[info] device: {torch.cuda.get_device_name(0)}")
+    n_gpu = _num_devices()
+    gpu_names = {torch.cuda.get_device_name(d) for d in range(n_gpu)}
+    print(f"[info] device: {n_gpu}x {'/'.join(sorted(gpu_names))}")
     print(f"[info] loading tokenizer for {args.model}")
     tok = AutoTokenizer.from_pretrained(args.model)
 
@@ -76,14 +90,16 @@ def main() -> None:
         print("[info] swapped attention modules to LlamaAttentionQuantized")
 
     load_s = time.perf_counter() - t0
-    vram_gb = torch.cuda.max_memory_allocated() / 1024**3
-    print(f"[info] load complete in {load_s:.1f}s, peak VRAM {vram_gb:.2f} GiB")
+    vram_gb = _peak_gib_all()
+    print(f"[info] load complete in {load_s:.1f}s, peak VRAM {vram_gb:.2f} GiB (sum across GPUs)")
 
-    inputs = tok(args.prompt, return_tensors="pt").to(model.device)
+    embed_dev = model.get_input_embeddings().weight.device
+    inputs = tok(args.prompt, return_tensors="pt").to(embed_dev)
     prompt_len = int(inputs["input_ids"].shape[1])
     print(f"[info] prompt tokens: {prompt_len}")
 
-    torch.cuda.reset_peak_memory_stats()
+    for d in range(_num_devices()):
+        torch.cuda.reset_peak_memory_stats(d)
 
     if args.trace_kv:
         _run_with_trace(model, tok, inputs, args, prompt_len)
@@ -106,7 +122,7 @@ def _run_with_generate(model, tok, inputs, args: argparse.Namespace, prompt_len:
     new_tokens = out.shape[1] - prompt_len
     tps = new_tokens / max(gen_s, 1e-6)
     print(f"[info] generated {new_tokens} tokens in {gen_s:.2f}s ({tps:.1f} tok/s)")
-    print(f"[info] peak VRAM after generate: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB")
+    print(f"[info] peak VRAM after generate: {_peak_gib_all():.2f} GiB (sum across GPUs)")
     if isinstance(past, QuantizedKVCache):
         print(f"[info] quant KV storage: {past.nbytes() / 1024**2:.2f} MiB")
     print("---")
@@ -131,7 +147,7 @@ def _run_with_trace(model, tok, inputs, args: argparse.Namespace, prompt_len: in
     gen_s = time.perf_counter() - t0
     tps = args.max_new_tokens / max(gen_s, 1e-6)
     print(f"[info] traced decode {args.max_new_tokens} tokens in {gen_s:.2f}s ({tps:.1f} tok/s)")
-    print(f"[info] peak VRAM after decode: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB")
+    print(f"[info] peak VRAM after decode: {_peak_gib_all():.2f} GiB (sum across GPUs)")
     print("---")
     print(tok.decode(inputs["input_ids"][0].tolist() + tokens, skip_special_tokens=True))
 
@@ -150,8 +166,8 @@ def _emit_trace(step: int, total_tokens: int, past) -> None:
             total = 0
         kv_mib = total / 1024**2
         kind = "bf16"
-    cuda_mib = torch.cuda.memory_allocated() / 1024**2
-    print(f"[trace] step={step:>4} total_tokens={total_tokens:>6} kv_{kind}={kv_mib:7.2f} MiB cuda_alloc={cuda_mib:7.2f} MiB")
+    cuda_mib = _alloc_mib_all()
+    print(f"[trace] step={step:>4} total_tokens={total_tokens:>6} kv_{kind}={kv_mib:7.2f} MiB cuda_alloc={cuda_mib:7.2f} MiB (sum)")
 
 
 if __name__ == "__main__":

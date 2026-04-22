@@ -8,6 +8,7 @@ Runs greedy decode on both paths over the same prompt and logs:
 Usage:
     python scripts/llama3_kv_parity.py
     python scripts/llama3_kv_parity.py --max-new-tokens 64 --group-size 32
+    python scripts/llama3_kv_parity.py --kernel-variant sm70
 """
 
 from __future__ import annotations
@@ -25,22 +26,28 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from models.llama3.kv_cache import QuantizedKVCache
-from models.llama3.llama3_quant import replace_llama_attention_with_quantized
+from models.llama3.kernel_variant import bind_quantized_kernel_variant, resolve_kernel_variant
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
 DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog. The capital of France is"
 
 
-def _load(model_id: str, device: torch.device, quantized: bool, group_size: int):
+def _load(model_id: str, quantized: bool, group_size: int, replace_fn):
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         dtype=torch.bfloat16,
-        device_map={"": device},
+        device_map="auto",
     ).eval()
     if quantized:
-        replace_llama_attention_with_quantized(model, group_size=group_size)
+        replace_fn(model, group_size=group_size)
     return model
+
+
+def _embed_device(model) -> torch.device:
+    try:
+        return model.get_input_embeddings().weight.device
+    except Exception:
+        return torch.device("cuda", 0)
 
 
 def _greedy_step(model, input_ids: torch.Tensor, past) -> tuple[torch.Tensor, torch.Tensor]:
@@ -55,22 +62,34 @@ def main() -> None:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--group-size", type=int, default=32)
+    parser.add_argument(
+        "--kernel-variant",
+        choices=("auto", "default", "sm70"),
+        default="auto",
+        help="INT4 kernel path: auto uses sm70 on GPUs below sm_80 (same as run_llama3_benchmark).",
+    )
     parser.add_argument("--out-json", default=None, help="Optional JSON dump of per-step metrics")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA not available; parity requires a GPU.")
-    device = torch.device("cuda")
 
-    print(f"[info] device: {torch.cuda.get_device_name(0)}")
+    variant = resolve_kernel_variant(args.kernel_variant)
+    QuantizedKVCache, replace_fn = bind_quantized_kernel_variant(variant)
+    print(f"[info] kernel variant: {variant}")
+
+    n_gpu = max(1, torch.cuda.device_count())
+    gpu_names = {torch.cuda.get_device_name(d) for d in range(n_gpu)}
+    print(f"[info] device: {n_gpu}x {'/'.join(sorted(gpu_names))}")
     print(f"[info] loading baseline (BF16 KV)...")
     t0 = time.perf_counter()
-    model_ref = _load(args.model, device, quantized=False, group_size=args.group_size)
+    model_ref = _load(args.model, quantized=False, group_size=args.group_size, replace_fn=replace_fn)
     ref_load = time.perf_counter() - t0
     print(f"[info] baseline loaded in {ref_load:.1f}s")
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    inputs = tok(args.prompt, return_tensors="pt").to(device)
+    embed_dev = _embed_device(model_ref)
+    inputs = tok(args.prompt, return_tensors="pt").to(embed_dev)
     prompt_ids = inputs["input_ids"]
     prompt_len = int(prompt_ids.shape[1])
     print(f"[info] prompt tokens: {prompt_len}")
@@ -80,33 +99,35 @@ def main() -> None:
     logits_ref, cache_ref = _greedy_step(model_ref, prompt_ids, cache_ref)
     tokens_ref: list[int] = [int(logits_ref.argmax(-1).item())]
     logits_ref_per_step: list[torch.Tensor] = [logits_ref.detach().cpu()]
-    next_ref = torch.tensor([[tokens_ref[-1]]], device=device, dtype=torch.long)
+    next_ref = torch.tensor([[tokens_ref[-1]]], device=embed_dev, dtype=torch.long)
     for _ in range(args.max_new_tokens - 1):
         logits_ref, cache_ref = _greedy_step(model_ref, next_ref, cache_ref)
         tokens_ref.append(int(logits_ref.argmax(-1).item()))
         logits_ref_per_step.append(logits_ref.detach().cpu())
-        next_ref = torch.tensor([[tokens_ref[-1]]], device=device, dtype=torch.long)
+        next_ref = torch.tensor([[tokens_ref[-1]]], device=embed_dev, dtype=torch.long)
 
     del model_ref
     torch.cuda.empty_cache()
 
     print(f"[info] loading quantized (INT4 KV, group_size={args.group_size})...")
     t0 = time.perf_counter()
-    model_q = _load(args.model, device, quantized=True, group_size=args.group_size)
+    model_q = _load(args.model, quantized=True, group_size=args.group_size, replace_fn=replace_fn)
     q_load = time.perf_counter() - t0
     print(f"[info] quantized loaded in {q_load:.1f}s")
+    embed_dev_q = _embed_device(model_q)
+    prompt_ids = prompt_ids.to(embed_dev_q)
 
     print(f"[info] prefilling quantized...")
     cache_q = QuantizedKVCache(group_size=args.group_size)
     logits_q, cache_q = _greedy_step(model_q, prompt_ids, cache_q)
     tokens_q: list[int] = [int(logits_q.argmax(-1).item())]
     logits_q_per_step: list[torch.Tensor] = [logits_q.detach().cpu()]
-    next_q = torch.tensor([[tokens_q[-1]]], device=device, dtype=torch.long)
+    next_q = torch.tensor([[tokens_q[-1]]], device=embed_dev_q, dtype=torch.long)
     for _ in range(args.max_new_tokens - 1):
         logits_q, cache_q = _greedy_step(model_q, next_q, cache_q)
         tokens_q.append(int(logits_q.argmax(-1).item()))
         logits_q_per_step.append(logits_q.detach().cpu())
-        next_q = torch.tensor([[tokens_q[-1]]], device=device, dtype=torch.long)
+        next_q = torch.tensor([[tokens_q[-1]]], device=embed_dev_q, dtype=torch.long)
 
     quant_kv_mib = cache_q.nbytes() / 1024**2
     print(f"[info] quant KV storage after {args.max_new_tokens} steps: {quant_kv_mib:.2f} MiB")
@@ -140,6 +161,7 @@ def main() -> None:
     if args.out_json is not None:
         data = {
             "model": args.model,
+            "kernel_variant": variant,
             "group_size": args.group_size,
             "max_new_tokens": args.max_new_tokens,
             "prompt": args.prompt,

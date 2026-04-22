@@ -1,4 +1,8 @@
-torch>=2.1
+# PyTorch: use PyTorch's CUDA wheel index so Volta (V100, sm_70) kernels are included.
+# Resolving torch only from PyPI can pick a build that omits CC 7.0.
+# Reinstall after changes: pip install -U -r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1
 triton>=3.0
 pytest>=7.0
 transformers>=4.45

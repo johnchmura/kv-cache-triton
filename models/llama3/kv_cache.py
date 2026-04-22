@@ -40,9 +40,17 @@ class QuantizedKVCache:
         layer = self._layers.get(layer_idx)
         return 0 if layer is None else int(layer.seq_len)
 
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+    def get_mask_sizes(self, cache_position, layer_idx: int) -> tuple[int, int]:
         past_len = self.get_seq_length(layer_idx)
-        query_length = int(cache_position.shape[0])
+        if isinstance(cache_position, int):
+            query_length = int(cache_position)
+        elif isinstance(cache_position, torch.Tensor):
+            if cache_position.dim() == 0:
+                query_length = int(cache_position.item())
+            else:
+                query_length = int(cache_position.shape[0])
+        else:
+            query_length = int(cache_position)
         return past_len + query_length, 0
 
     def get_max_cache_shape(self, layer_idx: int = 0) -> int:

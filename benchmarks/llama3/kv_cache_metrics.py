@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Iterable
-
 import torch
 
 from models.llama3.kv_cache import QuantizedKVCache
@@ -17,31 +15,51 @@ def kv_cache_nbytes(past) -> int:
     """Total bytes used by ``past`` for its cached K/V tensors.
 
     Handles both ``QuantizedKVCache`` (our own path) and the generic transformers
-    ``Cache`` interface (DynamicCache and its friends).
+    ``Cache`` interface (DynamicCache and its friends). Newer ``DynamicCache``
+    iterations may yield tuples longer than ``(key, value)``; we prefer
+    ``key_cache`` / ``value_cache`` when present.
     """
     if past is None:
         return 0
     if isinstance(past, QuantizedKVCache):
         return past.nbytes()
 
-    total = 0
-    try:
-        for keys, values in past:
-            if isinstance(keys, torch.Tensor):
-                total += _tensor_nbytes(keys)
-            if isinstance(values, torch.Tensor):
-                total += _tensor_nbytes(values)
-    except TypeError:
-        layers = getattr(past, "layers", None)
-        if layers is None:
-            return 0
+    key_cache = getattr(past, "key_cache", None)
+    value_cache = getattr(past, "value_cache", None)
+    if key_cache is not None and value_cache is not None:
+        total = 0
+        for t in list(key_cache) + list(value_cache):
+            if t is not None and isinstance(t, torch.Tensor):
+                total += _tensor_nbytes(t)
+        return total
+
+    layers = getattr(past, "layers", None)
+    if layers is not None:
+        total = 0
         for layer in layers:
+            if layer is None:
+                continue
             keys = getattr(layer, "keys", None)
             values = getattr(layer, "values", None)
             if isinstance(keys, torch.Tensor):
                 total += _tensor_nbytes(keys)
             if isinstance(values, torch.Tensor):
                 total += _tensor_nbytes(values)
+        return total
+
+    total = 0
+    try:
+        for layer_entry in past:
+            if layer_entry is None:
+                continue
+            if isinstance(layer_entry, (tuple, list)) and len(layer_entry) >= 2:
+                k, v = layer_entry[0], layer_entry[1]
+                if isinstance(k, torch.Tensor):
+                    total += _tensor_nbytes(k)
+                if isinstance(v, torch.Tensor):
+                    total += _tensor_nbytes(v)
+    except Exception:
+        return 0
     return total
 
 
