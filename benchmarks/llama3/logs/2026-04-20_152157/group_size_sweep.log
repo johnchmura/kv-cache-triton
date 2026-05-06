@@ -1,0 +1,4 @@
+g= 32: K mae=0.0812 V mae=0.0812  kv_bytes=  4.50 MiB (3.56x)  fused=0.46 ms  attn_mae=0.0028
+g= 64: K mae=0.0912 V mae=0.0913  kv_bytes=  4.25 MiB (3.76x)  fused=0.46 ms  attn_mae=0.0031
+g=128: K mae=0.1002 V mae=0.1002  kv_bytes=  4.12 MiB (3.88x)  fused=0.44 ms  attn_mae=0.0034
+[info] wrote benchmarks/llama3/logs/2026-04-20_152157/group_size_sweep_s4096

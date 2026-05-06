@@ -1,0 +1,30 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.5, pytest-8.4.2, pluggy-1.5.0 -- /home/jchmura/miniconda3/bin/python
+cachedir: .pytest_cache
+rootdir: /home/jchmura/github/workspaces/kv_cache_triton
+configfile: pytest.ini
+plugins: anyio-4.11.0
+collecting ... collected 20 items
+
+tests/llama3/test_attention_quant_gqa.py::test_gqa_decode_matches_sdpa_reference[128-32] PASSED [  5%]
+tests/llama3/test_attention_quant_gqa.py::test_gqa_decode_matches_sdpa_reference[128-64] PASSED [ 10%]
+tests/llama3/test_attention_quant_gqa.py::test_gqa_decode_matches_sdpa_reference[1024-32] PASSED [ 15%]
+tests/llama3/test_attention_quant_gqa.py::test_gqa_decode_matches_sdpa_reference[1024-64] PASSED [ 20%]
+tests/llama3/test_attention_quant_gqa.py::test_gqa_prefill_causal_matches_reference PASSED [ 25%]
+tests/llama3/test_attention_quant_gqa.py::test_gqa_mha_case_equivalence PASSED [ 30%]
+tests/llama3/test_attention_quant_gqa.py::test_gqa_validation_errors PASSED [ 35%]
+tests/llama3/test_llama3_generate_parity.py::test_greedy_agrees_first_steps PASSED [ 40%]
+tests/llama3/test_llama3_quant_decode.py::test_prefill_plus_decode_matches_reference PASSED [ 45%]
+tests/llama3/test_llama3_quant_decode.py::test_quantized_cache_tracks_seq_len PASSED [ 50%]
+tests/llama3/test_llama3_quant_decode.py::test_quant_cache_kv_bytes_smaller PASSED [ 55%]
+tests/llama3/test_quantize.py::test_round_trip_torch_bf16[32] PASSED     [ 60%]
+tests/llama3/test_quantize.py::test_round_trip_torch_bf16[64] PASSED     [ 65%]
+tests/llama3/test_quantize.py::test_round_trip_torch_bf16[128] PASSED    [ 70%]
+tests/llama3/test_quantize.py::test_triton_matches_torch_bf16[32] PASSED [ 75%]
+tests/llama3/test_quantize.py::test_triton_matches_torch_bf16[64] PASSED [ 80%]
+tests/llama3/test_quantize.py::test_triton_matches_torch_bf16[128] PASSED [ 85%]
+tests/llama3/test_quantize.py::test_scales_dtype_tracks_input PASSED     [ 90%]
+tests/llama3/test_quantize.py::test_dequantize_out_dtype PASSED          [ 95%]
+tests/llama3/test_quantize.py::test_invalid_args PASSED                  [100%]
+
+============================== 20 passed in 2.69s ==============================
