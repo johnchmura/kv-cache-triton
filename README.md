@@ -1,7 +1,7 @@
 # kv-cache-triton
 
 Triton kernels for attention-related workloads (Phase 1: synthetic tensors; later LLaMA-style quantization hooks).
-
+Access the paper we wrote on this in triton_kv_cache_report.pdf
 ## Layout
 
 - `kernels/` — Triton kernels (GPT-2 lives in `kernels/gpt2/`)
